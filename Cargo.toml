@@ -1,0 +1,23 @@
+[package]
+name = "ember-query"
+version = "0.1.0"
+edition = "2021"
+description = "A small vectorized SQL engine for CSV/Parquet files"
+
+[[bin]]
+name = "ember-query"
+path = "src/main.rs"
+
+[dependencies]
+arrow       = "53"
+csv         = "1"
+pest        = "2"
+pest_derive = "2"
+clap        = { version = "4", features = ["derive"] }
+anyhow      = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+opt-level = 3
