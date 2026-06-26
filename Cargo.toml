@@ -8,6 +8,10 @@ description = "A small vectorized SQL engine for CSV/Parquet files"
 name = "ember-query"
 path = "src/main.rs"
 
+[lib]
+name = "ember_query"
+path = "src/lib.rs"
+
 [dependencies]
 arrow       = "53"
 csv         = "1"

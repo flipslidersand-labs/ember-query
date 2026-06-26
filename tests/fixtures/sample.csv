@@ -1,0 +1,6 @@
+id,name,price,in_stock
+1,Apple,1500,true
+2,Banana,200,true
+3,Cherry,3500,false
+4,Date,800,true
+5,Elderberry,4200,false

@@ -1,0 +1,81 @@
+// Whitespace and comment handling
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "--" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
+
+// Top-level rule
+query = { SOI ~ select_stmt ~ ";"? ~ EOI }
+
+select_stmt = {
+    ^"SELECT" ~ select_list
+    ~ ^"FROM" ~ table_name
+    ~ where_clause?
+    ~ group_by_clause?
+    ~ limit_clause?
+}
+
+// SELECT list
+select_list = { select_item ~ ("," ~ select_item)* }
+select_item = { wildcard | aliased_expr }
+aliased_expr = { expr ~ (^"AS" ~ ident)? }
+wildcard = { "*" }
+
+// FROM clause
+table_name = @{ ident }
+
+// WHERE clause
+where_clause = { ^"WHERE" ~ expr }
+
+// GROUP BY clause
+group_by_clause = { ^"GROUP" ~ ^"BY" ~ ident ~ ("," ~ ident)* }
+
+// LIMIT clause
+limit_clause = { ^"LIMIT" ~ integer }
+
+// Expressions — precedence climbing
+expr = { or_expr }
+
+or_expr  = { and_expr  ~ (^"OR"  ~ and_expr)* }
+and_expr = { not_expr  ~ (^"AND" ~ not_expr)* }
+not_expr = { (^"NOT" ~ not_expr) | cmp_expr }
+
+cmp_expr = { add_expr ~ (cmp_op ~ add_expr)? }
+cmp_op   = { "<>" | "<=" | ">=" | "!=" | "<" | ">" | "=" }
+
+add_expr = { mul_expr ~ (add_op ~ mul_expr)* }
+add_op   = { "+" | "-" }
+
+mul_expr = { unary_expr ~ (mul_op ~ unary_expr)* }
+mul_op   = { "*" | "/" }
+
+unary_expr = { ("-" ~ unary_expr) | primary }
+
+primary = {
+    "(" ~ expr ~ ")"
+  | func_call
+  | literal
+  | column_ref
+}
+
+// Function calls  COUNT(*), AVG(col), SUM(col), MIN(col), MAX(col), COUNT(col)
+func_call = { func_name ~ "(" ~ func_args ~ ")" }
+func_name = @{ ^"COUNT" | ^"AVG" | ^"SUM" | ^"MIN" | ^"MAX" }
+func_args = { star_arg | expr }
+star_arg  = { "*" }
+
+// Column reference (qualified or plain)
+column_ref = @{ ident }
+
+// Identifiers
+ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Literals
+literal = { null_lit | bool_lit | float_lit | integer_lit | string_lit }
+
+null_lit    = { ^"NULL" }
+bool_lit    = { ^"TRUE" | ^"FALSE" }
+float_lit   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* }
+integer_lit = @{ "-"? ~ ASCII_DIGIT+ }
+string_lit  = @{ "'" ~ (!"'" ~ ANY)* ~ "'" | "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+
+// Bare integer used in LIMIT
+integer = @{ ASCII_DIGIT+ }
