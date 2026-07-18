@@ -34,8 +34,18 @@ fn main() -> Result<()> {
     // 2. Parse SQL
     let stmt = sql::parse(&cli.sql)?;
 
-    // 3. Build logical plan
-    let logical_plan = planner::build(&stmt, path, schema)?;
+    // 3. Build catalog: infer schema for each JOIN table from sibling CSVs
+    let mut cat: std::collections::HashMap<String, (String, catalog::TableSchema)> =
+        std::collections::HashMap::new();
+    for join in &stmt.joins {
+        let join_path = format!("{}.csv", join.table);
+        if let Ok(s) = catalog::infer_schema(Path::new(&join_path)) {
+            cat.insert(join.table.clone(), (join_path, s));
+        }
+    }
+
+    // 4. Build logical plan
+    let logical_plan = planner::build(&stmt, path, schema, &cat)?;
 
     if cli.explain {
         println!("Logical Plan:\n{}", logical_plan.explain(0));

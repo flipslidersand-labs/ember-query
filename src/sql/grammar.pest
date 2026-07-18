@@ -7,9 +7,11 @@ query = { SOI ~ select_stmt ~ ";"? ~ EOI }
 
 select_stmt = {
     ^"SELECT" ~ select_list
-    ~ ^"FROM" ~ table_name
+    ~ ^"FROM" ~ table_ref
+    ~ join_clause*
     ~ where_clause?
     ~ group_by_clause?
+    ~ order_by_clause?
     ~ limit_clause?
 }
 
@@ -19,14 +21,23 @@ select_item = { wildcard | aliased_expr }
 aliased_expr = { expr ~ (^"AS" ~ ident)? }
 wildcard = { "*" }
 
-// FROM clause
-table_name = @{ ident }
+// FROM clause — table with optional alias
+table_ref = { table_name ~ (^"AS" ~ table_alias)? }
+table_name  = @{ ident }
+table_alias = @{ ident }
+
+// JOIN clause (INNER JOIN only for Phase 5)
+join_clause = { (^"INNER" ~ ^"JOIN" | ^"JOIN") ~ table_ref ~ ^"ON" ~ expr }
 
 // WHERE clause
 where_clause = { ^"WHERE" ~ expr }
 
 // GROUP BY clause
 group_by_clause = { ^"GROUP" ~ ^"BY" ~ ident ~ ("," ~ ident)* }
+
+// ORDER BY clause
+order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_item ~ ("," ~ order_item)* }
+order_item = { column_ref ~ (^"ASC" | ^"DESC")? }
 
 // LIMIT clause
 limit_clause = { ^"LIMIT" ~ integer }
@@ -62,8 +73,8 @@ func_name = @{ ^"COUNT" | ^"AVG" | ^"SUM" | ^"MIN" | ^"MAX" }
 func_args = { star_arg | expr }
 star_arg  = { "*" }
 
-// Column reference (qualified or plain)
-column_ref = @{ ident }
+// Column reference — qualified (table.col) or plain (col)
+column_ref = @{ ident ~ ("." ~ ident)? }
 
 // Identifiers
 ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

@@ -1,4 +1,9 @@
 pub mod csv_scan;
+pub mod join;
+#[cfg(test)]
+#[path = "join_test.rs"]
+mod join_test;
+pub mod sort;
 pub mod filter;
 pub mod hash_agg;
 pub mod limit;
@@ -192,6 +197,21 @@ pub fn build_executor(plan: LogicalPlan) -> Result<Box<dyn Executor>> {
         } => {
             let child = build_executor(*input)?;
             Ok(Box::new(hash_agg::HashAggExec::new(child, group_by, aggs)?))
+        }
+        LogicalPlan::Join {
+            left,
+            right_path,
+            right_schema,
+            on,
+            ..
+        } => {
+            let left_exec = build_executor(*left)?;
+            let right_exec = Box::new(csv_scan::CsvScanExec::new(&right_path, right_schema)?);
+            Ok(Box::new(join::HashJoinExec::new(left_exec, right_exec, &on)?))
+        }
+        LogicalPlan::Sort { input, order_by } => {
+            let child = build_executor(*input)?;
+            Ok(Box::new(sort::SortExec::new(child, order_by)?))
         }
     }
 }

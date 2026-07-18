@@ -6,7 +6,8 @@ fn run_query(csv_path: &str, sql: &str) -> Result<Vec<RecordBatch>> {
     // Reuse the same pipeline as main.rs
     let schema = ember_query::catalog::infer_schema(Path::new(csv_path))?;
     let stmt = ember_query::sql::parse(sql)?;
-    let plan = ember_query::planner::build(&stmt, csv_path, schema)?;
+    let cat = std::collections::HashMap::new();
+    let plan = ember_query::planner::build(&stmt, csv_path, schema, &cat)?;
     let mut exec = ember_query::executor::build_executor(plan)?;
 
     let mut batches = Vec::new();

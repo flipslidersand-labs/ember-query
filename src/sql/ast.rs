@@ -77,13 +77,30 @@ pub enum SelectItem {
     Expr(Expr, Option<String>),
 }
 
+/// An INNER JOIN clause.
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub table: String,
+    pub alias: Option<String>,
+    pub on: Expr,
+}
+
+/// One item in an ORDER BY clause.
+#[derive(Debug, Clone)]
+pub struct OrderByItem {
+    pub column: String,
+    pub asc: bool,
+}
+
 /// A parsed SELECT statement.
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
     pub select: Vec<SelectItem>,
-    #[allow(dead_code)]
     pub from: String,
+    pub from_alias: Option<String>,
+    pub joins: Vec<JoinClause>,
     pub where_: Option<Expr>,
     pub group_by: Vec<String>,
+    pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
 }

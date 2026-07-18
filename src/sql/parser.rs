@@ -30,16 +30,21 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
     let select_list = inner.next().ok_or_else(|| anyhow!("missing select_list"))?;
     let select = parse_select_list(select_list)?;
 
-    // table_name
-    let table = inner.next().ok_or_else(|| anyhow!("missing table_name"))?;
-    let from = table.as_str().to_string();
+    // table_ref (table_name + optional alias)
+    let table_ref = inner.next().ok_or_else(|| anyhow!("missing table_ref"))?;
+    let (from, from_alias) = parse_table_ref(table_ref);
 
+    let mut joins = Vec::new();
     let mut where_ = None;
     let mut group_by = Vec::new();
+    let mut order_by = Vec::new();
     let mut limit = None;
 
     for p in inner {
         match p.as_rule() {
+            Rule::join_clause => {
+                joins.push(parse_join_clause(p)?);
+            }
             Rule::where_clause => {
                 let expr_pair = p.into_inner().next().ok_or_else(|| anyhow!("empty WHERE"))?;
                 where_ = Some(parse_expr(expr_pair)?);
@@ -48,6 +53,13 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
                 for col in p.into_inner() {
                     if col.as_rule() == Rule::ident {
                         group_by.push(col.as_str().to_string());
+                    }
+                }
+            }
+            Rule::order_by_clause => {
+                for item in p.into_inner() {
+                    if item.as_rule() == Rule::order_item {
+                        order_by.push(parse_order_item(item));
                     }
                 }
             }
@@ -66,10 +78,43 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
     Ok(SelectStmt {
         select,
         from,
+        from_alias,
+        joins,
         where_,
         group_by,
+        order_by,
         limit,
     })
+}
+
+fn parse_table_ref(pair: Pair<Rule>) -> (String, Option<String>) {
+    let mut inner = pair.into_inner();
+    let name = inner
+        .next()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_default();
+    let alias = inner.next().map(|p| p.as_str().to_string());
+    (name, alias)
+}
+
+fn parse_join_clause(pair: Pair<Rule>) -> Result<super::ast::JoinClause> {
+    let mut inner = pair.into_inner();
+    let table_ref = inner.next().ok_or_else(|| anyhow!("JOIN missing table"))?;
+    let (table, alias) = parse_table_ref(table_ref);
+    let on_pair = inner.next().ok_or_else(|| anyhow!("JOIN missing ON expr"))?;
+    let on = parse_expr(on_pair)?;
+    Ok(super::ast::JoinClause { table, alias, on })
+}
+
+fn parse_order_item(pair: Pair<Rule>) -> super::ast::OrderByItem {
+    let text = pair.as_str().to_uppercase();
+    let asc = !text.ends_with("DESC");
+    let column = pair
+        .into_inner()
+        .next()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_default();
+    super::ast::OrderByItem { column, asc }
 }
 
 fn parse_select_list(pair: Pair<Rule>) -> Result<Vec<SelectItem>> {
