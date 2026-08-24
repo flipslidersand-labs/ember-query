@@ -1,41 +1,33 @@
 # ember-query
 
-> 🟡 **Scaffold Phase** — 基本設計と MVP 実装準備中
+Vectorized SQL query engine for lightweight analytical workloads on CSV and Parquet files (Rust).
 
-Vectorized SQL query engine with embedded index for lightweight analytical workloads
+> 🟡 **Scaffold Phase** — Core design in progress, MVP implementation starting Q3 2026
 
-## ステータス
+## Status
 
-| 項目 | 状態 |
+| Item | State |
 |------|------|
-| **フェーズ** | Scaffold |
-| **実装予定** | 2026-Q3 MVP開始 |
-| **テスト** | 未実装 |
-| **ドキュメント** | 企画中 |
+| Phase | Scaffold |
+| MVP Target | Q3 2026 |
+| Tests | Planned |
+| Docs | Planned |
 
-## 技術スタック
+## Tech Stack
 
-- **言語:** Rust
-- **ビルドツール:** Cargo
-- **最終更新:** 2026-06-26
+- **Language:** Rust
+- **Build:** Cargo
+- **Target formats:** CSV, Parquet
 
-## 実装ロードマップ
+## Roadmap
 
-1. **Phase 1 (Q3 2026):** 基本設計 + MVP スケルトン
-2. **Phase 2 (Q4 2026):** コア機能実装 + テスト
-3. **Phase 3 (Q1 2027):** パフォーマンス最適化 + ドキュメント完成
-4. **Phase 4 (Q2 2027):** 本番デプロイ
+1. **Phase 1 (Q3 2026)** — SQL parser + scan layer
+2. **Phase 2 (Q4 2026)** — Vectorized execution engine + embedded index
+3. **Phase 3 (Q1 2027)** — Query optimizer + aggregations
+4. **Phase 4 (Q2 2027)** — Benchmarking + docs
 
-## 参考資料
+## Notes
 
-- [dev-nodee-infrastructure CLAUDE.md](https://github.com/flipslidersand/dev-nodee-infrastructure/blob/master/CLAUDE.md) — 詳細な実装方針
-- [GitHub Issues](https://github.com/flipslidersand/dev-nodee-infrastructure/issues) — 実装計画・進捗
+- API and design subject to change during scaffold phase
+- No test coverage yet — quality guarantees begin at Phase 2
 
-## 注意事項
-
-- **開発中**: API/設計は予告なく変更される可能性があります
-- **テスト未実装**: 本格実装まで品質保証していません
-
----
-
-詳細な実装計画は [GitHub Issues](https://github.com/flipslidersand/dev-nodee-infrastructure/issues) を参照してください。
