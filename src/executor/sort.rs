@@ -24,7 +24,12 @@ impl SortExec {
         }
 
         if all_batches.is_empty() {
-            return Ok(SortExec { schema, batches: vec![], cursor: 0, done: false });
+            return Ok(SortExec {
+                schema,
+                batches: vec![],
+                cursor: 0,
+                done: false,
+            });
         }
 
         // Concatenate all batches into one for sorting
@@ -123,7 +128,10 @@ fn compare_rows(arr: &ArrayRef, a: usize, b: usize) -> std::cmp::Ordering {
         return a_arr.value(a).cmp(&a_arr.value(b));
     }
     if let Some(a_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-        return a_arr.value(a).partial_cmp(&a_arr.value(b)).unwrap_or(std::cmp::Ordering::Equal);
+        return a_arr
+            .value(a)
+            .partial_cmp(&a_arr.value(b))
+            .unwrap_or(std::cmp::Ordering::Equal);
     }
     if let Some(a_arr) = arr.as_any().downcast_ref::<StringArray>() {
         return a_arr.value(a).cmp(a_arr.value(b));
