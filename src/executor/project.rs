@@ -24,16 +24,12 @@ impl ProjectExec {
                 SelectItem::Wildcard => {
                     // Expand all columns
                     for field in in_schema.fields() {
-                        projections.push((
-                            field.name().clone(),
-                            Expr::Column(field.name().clone()),
-                        ));
+                        projections
+                            .push((field.name().clone(), Expr::Column(field.name().clone())));
                     }
                 }
                 SelectItem::Expr(expr, alias) => {
-                    let name = alias
-                        .clone()
-                        .unwrap_or_else(|| expr_name(expr, &in_schema));
+                    let name = alias.clone().unwrap_or_else(|| expr_name(expr, &in_schema));
                     projections.push((name, expr.clone()));
                 }
             }

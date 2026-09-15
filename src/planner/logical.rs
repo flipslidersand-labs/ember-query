@@ -7,10 +7,7 @@ use crate::sql::ast::{AggFunc, Expr, OrderByItem, SelectItem, SelectStmt};
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
     /// Table scan — reads the CSV at `path` with the given schema.
-    Scan {
-        path: String,
-        schema: TableSchema,
-    },
+    Scan { path: String, schema: TableSchema },
     /// Filter rows by a predicate expression.
     Filter {
         input: Box<LogicalPlan>,
@@ -22,10 +19,7 @@ pub enum LogicalPlan {
         exprs: Vec<SelectItem>,
     },
     /// Limit the number of output rows.
-    Limit {
-        input: Box<LogicalPlan>,
-        n: u64,
-    },
+    Limit { input: Box<LogicalPlan>, n: u64 },
     /// Hash aggregation with optional GROUP BY.
     Aggregate {
         input: Box<LogicalPlan>,
@@ -100,10 +94,17 @@ impl LogicalPlan {
                     input.explain(depth + 1)
                 )
             }
-            LogicalPlan::Join { left, right_path, on, .. } => {
+            LogicalPlan::Join {
+                left,
+                right_path,
+                on,
+                ..
+            } => {
                 format!(
                     "{}Join [right={}, on={:?}]\n{}",
-                    indent, right_path, on,
+                    indent,
+                    right_path,
+                    on,
                     left.explain(depth + 1)
                 )
             }
@@ -111,7 +112,11 @@ impl LogicalPlan {
                 format!(
                     "{}Sort [{:?}]\n{}",
                     indent,
-                    order_by.iter().map(|o| format!("{} {}", o.column, if o.asc { "ASC" } else { "DESC" })).collect::<Vec<_>>().join(", "),
+                    order_by
+                        .iter()
+                        .map(|o| format!("{} {}", o.column, if o.asc { "ASC" } else { "DESC" }))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     input.explain(depth + 1)
                 )
             }
@@ -198,9 +203,7 @@ fn collect_aggs(select: &[SelectItem]) -> Vec<(AggFunc, Expr, String)> {
     for (i, item) in select.iter().enumerate() {
         if let SelectItem::Expr(expr, alias) = item {
             if let Expr::Agg { func, expr: arg } = expr {
-                let name = alias
-                    .clone()
-                    .unwrap_or_else(|| format!("agg_{}", i));
+                let name = alias.clone().unwrap_or_else(|| format!("agg_{}", i));
                 result.push((func.clone(), *arg.clone(), name));
             }
         }
