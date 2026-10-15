@@ -1,7 +1,5 @@
 use anyhow::{anyhow, Result};
-use arrow::array::{
-    ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
-};
+use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;

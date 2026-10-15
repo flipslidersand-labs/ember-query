@@ -30,8 +30,9 @@ impl HashJoinExec {
         on: &Expr,
     ) -> Result<Self> {
         // Extract equality columns from the ON expression
-        let (left_col, right_col) = extract_eq_columns(on)
-            .ok_or_else(|| anyhow!("JOIN ON must be an equality expression (left_col = right_col)"))?;
+        let (left_col, right_col) = extract_eq_columns(on).ok_or_else(|| {
+            anyhow!("JOIN ON must be an equality expression (left_col = right_col)")
+        })?;
 
         // Collect all right batches into a hash map: right_key_value → [row_index, batch_index]
         let mut right_batches: Vec<RecordBatch> = Vec::new();

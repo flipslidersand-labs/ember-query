@@ -11,8 +11,8 @@ pub struct SqlParser;
 
 /// Entry point — parses a SQL string into a `SelectStmt`.
 pub fn parse(sql: &str) -> Result<SelectStmt> {
-    let mut pairs = SqlParser::parse(Rule::query, sql)
-        .map_err(|e| anyhow!("Parse error: {}", e))?;
+    let mut pairs =
+        SqlParser::parse(Rule::query, sql).map_err(|e| anyhow!("Parse error: {}", e))?;
 
     let query = pairs.next().ok_or_else(|| anyhow!("empty parse"))?;
     let select_stmt = query
@@ -46,7 +46,10 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
                 joins.push(parse_join_clause(p)?);
             }
             Rule::where_clause => {
-                let expr_pair = p.into_inner().next().ok_or_else(|| anyhow!("empty WHERE"))?;
+                let expr_pair = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| anyhow!("empty WHERE"))?;
                 where_ = Some(parse_expr(expr_pair)?);
             }
             Rule::group_by_clause => {
@@ -101,7 +104,9 @@ fn parse_join_clause(pair: Pair<Rule>) -> Result<super::ast::JoinClause> {
     let mut inner = pair.into_inner();
     let table_ref = inner.next().ok_or_else(|| anyhow!("JOIN missing table"))?;
     let (table, alias) = parse_table_ref(table_ref);
-    let on_pair = inner.next().ok_or_else(|| anyhow!("JOIN missing ON expr"))?;
+    let on_pair = inner
+        .next()
+        .ok_or_else(|| anyhow!("JOIN missing ON expr"))?;
     let on = parse_expr(on_pair)?;
     Ok(super::ast::JoinClause { table, alias, on })
 }
@@ -128,12 +133,17 @@ fn parse_select_list(pair: Pair<Rule>) -> Result<Vec<SelectItem>> {
 }
 
 fn parse_select_item(pair: Pair<Rule>) -> Result<SelectItem> {
-    let inner = pair.into_inner().next().ok_or_else(|| anyhow!("empty select_item"))?;
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| anyhow!("empty select_item"))?;
     match inner.as_rule() {
         Rule::wildcard => Ok(SelectItem::Wildcard),
         Rule::aliased_expr => {
             let mut parts = inner.into_inner();
-            let expr_pair = parts.next().ok_or_else(|| anyhow!("missing expr in aliased_expr"))?;
+            let expr_pair = parts
+                .next()
+                .ok_or_else(|| anyhow!("missing expr in aliased_expr"))?;
             let expr = parse_expr(expr_pair)?;
             let alias = parts.next().map(|p| p.as_str().to_string());
             Ok(SelectItem::Expr(expr, alias))
@@ -145,7 +155,10 @@ fn parse_select_item(pair: Pair<Rule>) -> Result<SelectItem> {
 fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
     match pair.as_rule() {
         Rule::expr => {
-            let inner = pair.into_inner().next().ok_or_else(|| anyhow!("empty expr"))?;
+            let inner = pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| anyhow!("empty expr"))?;
             parse_expr(inner)
         }
         Rule::or_expr => parse_or_expr(pair),
@@ -208,7 +221,11 @@ fn parse_not_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_cmp_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
-    let left = parse_expr(children.next().ok_or_else(|| anyhow!("empty cmp_expr lhs"))?)?;
+    let left = parse_expr(
+        children
+            .next()
+            .ok_or_else(|| anyhow!("empty cmp_expr lhs"))?,
+    )?;
 
     if let Some(op_pair) = children.next() {
         let op = match op_pair.as_str() {
@@ -220,7 +237,11 @@ fn parse_cmp_expr(pair: Pair<Rule>) -> Result<Expr> {
             ">=" => BinOp::Ge,
             s => return Err(anyhow!("unknown cmp_op: {}", s)),
         };
-        let right = parse_expr(children.next().ok_or_else(|| anyhow!("missing cmp_expr rhs"))?)?;
+        let right = parse_expr(
+            children
+                .next()
+                .ok_or_else(|| anyhow!("missing cmp_expr rhs"))?,
+        )?;
         Ok(Expr::BinOp {
             op,
             left: Box::new(left),
@@ -241,7 +262,11 @@ fn parse_add_expr(pair: Pair<Rule>) -> Result<Expr> {
             "-" => BinOp::Sub,
             s => return Err(anyhow!("unknown add_op: {}", s)),
         };
-        let right = parse_expr(children.next().ok_or_else(|| anyhow!("missing add_expr rhs"))?)?;
+        let right = parse_expr(
+            children
+                .next()
+                .ok_or_else(|| anyhow!("missing add_expr rhs"))?,
+        )?;
         left = Expr::BinOp {
             op,
             left: Box::new(left),
@@ -261,7 +286,11 @@ fn parse_mul_expr(pair: Pair<Rule>) -> Result<Expr> {
             "/" => BinOp::Div,
             s => return Err(anyhow!("unknown mul_op: {}", s)),
         };
-        let right = parse_expr(children.next().ok_or_else(|| anyhow!("missing mul_expr rhs"))?)?;
+        let right = parse_expr(
+            children
+                .next()
+                .ok_or_else(|| anyhow!("missing mul_expr rhs"))?,
+        )?;
         left = Expr::BinOp {
             op,
             left: Box::new(left),
@@ -275,7 +304,9 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
     let first = children.next().ok_or_else(|| anyhow!("empty unary_expr"))?;
     if first.as_str() == "-" {
-        let inner = children.next().ok_or_else(|| anyhow!("missing unary_expr operand"))?;
+        let inner = children
+            .next()
+            .ok_or_else(|| anyhow!("missing unary_expr operand"))?;
         Ok(Expr::Unary {
             op: UnaryOp::Neg,
             expr: Box::new(parse_expr(inner)?),
@@ -286,7 +317,10 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_primary(pair: Pair<Rule>) -> Result<Expr> {
-    let inner = pair.into_inner().next().ok_or_else(|| anyhow!("empty primary"))?;
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| anyhow!("empty primary"))?;
     match inner.as_rule() {
         Rule::expr => parse_expr(inner),
         Rule::func_call => parse_func_call(inner),
@@ -298,7 +332,9 @@ fn parse_primary(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_func_call(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
-    let name_pair = children.next().ok_or_else(|| anyhow!("missing func_name"))?;
+    let name_pair = children
+        .next()
+        .ok_or_else(|| anyhow!("missing func_name"))?;
     let func = match name_pair.as_str().to_uppercase().as_str() {
         "COUNT" => AggFunc::Count,
         "SUM" => AggFunc::Sum,
@@ -308,8 +344,13 @@ fn parse_func_call(pair: Pair<Rule>) -> Result<Expr> {
         n => return Err(anyhow!("unknown function: {}", n)),
     };
 
-    let args_pair = children.next().ok_or_else(|| anyhow!("missing func_args"))?;
-    let arg_inner = args_pair.into_inner().next().ok_or_else(|| anyhow!("empty func_args"))?;
+    let args_pair = children
+        .next()
+        .ok_or_else(|| anyhow!("missing func_args"))?;
+    let arg_inner = args_pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| anyhow!("empty func_args"))?;
 
     let arg_expr = match arg_inner.as_rule() {
         Rule::star_arg => Expr::Wildcard,
@@ -323,7 +364,10 @@ fn parse_func_call(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_literal_expr(pair: Pair<Rule>) -> Result<Expr> {
-    let inner = pair.into_inner().next().ok_or_else(|| anyhow!("empty literal"))?;
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| anyhow!("empty literal"))?;
     let val = match inner.as_rule() {
         Rule::null_lit => Value::Null,
         Rule::bool_lit => {
