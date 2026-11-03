@@ -1,24 +1,27 @@
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    use crate::executor::{build_executor, Executor};
-    use crate::planner::logical::LogicalPlan;
-    use crate::catalog::TableSchema;
-    use crate::sql::ast::{BinOp, Expr};
     use crate::executor::join::HashJoinExec;
+    use crate::executor::Executor;
+
+    use crate::sql::ast::{BinOp, Expr};
 
     fn make_schema(fields: Vec<(&str, DataType)>) -> Arc<Schema> {
         Arc::new(Schema::new(
-            fields.into_iter().map(|(n, t)| Field::new(n, t, true)).collect::<Vec<_>>()
+            fields
+                .into_iter()
+                .map(|(n, t)| Field::new(n, t, true))
+                .collect::<Vec<_>>(),
         ))
     }
 
     fn make_batch(schema: Arc<Schema>, cols: Vec<Vec<i64>>) -> RecordBatch {
-        let arrays: Vec<Arc<dyn arrow::array::Array>> = cols.into_iter()
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = cols
+            .into_iter()
             .map(|v| Arc::new(Int64Array::from(v)) as _)
             .collect();
         RecordBatch::try_new(schema, arrays).unwrap()
@@ -32,7 +35,11 @@ mod tests {
 
     impl VecExec {
         fn new(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Self {
-            VecExec { schema, batches, idx: 0 }
+            VecExec {
+                schema,
+                batches,
+                idx: 0,
+            }
         }
     }
 
@@ -107,7 +114,7 @@ mod tests {
         use crate::sql::ast::BinOp;
         let s = make_schema(vec![("id", DataType::Int64)]);
         let on = Expr::BinOp {
-            op: BinOp::Lt,  // not equality
+            op: BinOp::Lt, // not equality
             left: Box::new(Expr::Column("id".into())),
             right: Box::new(Expr::Column("id".into())),
         };

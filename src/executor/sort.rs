@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
 
 use super::Executor;
 use crate::sql::ast::OrderByItem;
@@ -24,7 +23,12 @@ impl SortExec {
         }
 
         if all_batches.is_empty() {
-            return Ok(SortExec { schema, batches: vec![], cursor: 0, done: false });
+            return Ok(SortExec {
+                schema,
+                batches: vec![],
+                cursor: 0,
+                done: false,
+            });
         }
 
         // Concatenate all batches into one for sorting
@@ -106,7 +110,7 @@ impl Executor for SortExec {
 }
 
 fn strip_table_prefix(col: &str) -> &str {
-    col.split('.').last().unwrap_or(col)
+    col.split('.').next_back().unwrap_or(col)
 }
 
 fn compare_rows(arr: &ArrayRef, a: usize, b: usize) -> std::cmp::Ordering {
@@ -123,7 +127,10 @@ fn compare_rows(arr: &ArrayRef, a: usize, b: usize) -> std::cmp::Ordering {
         return a_arr.value(a).cmp(&a_arr.value(b));
     }
     if let Some(a_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-        return a_arr.value(a).partial_cmp(&a_arr.value(b)).unwrap_or(std::cmp::Ordering::Equal);
+        return a_arr
+            .value(a)
+            .partial_cmp(&a_arr.value(b))
+            .unwrap_or(std::cmp::Ordering::Equal);
     }
     if let Some(a_arr) = arr.as_any().downcast_ref::<StringArray>() {
         return a_arr.value(a).cmp(a_arr.value(b));

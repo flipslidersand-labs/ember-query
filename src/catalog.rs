@@ -22,11 +22,7 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
         .has_headers(true)
         .from_path(path)?;
 
-    let headers: Vec<String> = reader
-        .headers()?
-        .iter()
-        .map(|h| h.to_string())
-        .collect();
+    let headers: Vec<String> = reader.headers()?.iter().map(|h| h.to_string()).collect();
 
     // Collect up to 100 sample rows for type inference.
     let mut samples: Vec<Vec<String>> = Vec::new();

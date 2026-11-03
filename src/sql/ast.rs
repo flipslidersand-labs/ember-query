@@ -96,7 +96,9 @@ pub struct OrderByItem {
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
     pub select: Vec<SelectItem>,
+    #[allow(dead_code)] // parsed but not yet consumed by the planner
     pub from: String,
+    #[allow(dead_code)] // parsed but not yet consumed by the planner
     pub from_alias: Option<String>,
     pub joins: Vec<JoinClause>,
     pub where_: Option<Expr>,
