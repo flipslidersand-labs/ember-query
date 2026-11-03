@@ -47,6 +47,7 @@ pub fn print_batch(batch: &RecordBatch) {
     println!("{}", separator);
 
     // Print rows
+    #[allow(clippy::needless_range_loop)] // row indexes every column in col_data
     for row in 0..n_rows {
         let line: String = (0..n_cols)
             .map(|i| format!("{:<width$}", col_data[i][row], width = col_widths[i]))
