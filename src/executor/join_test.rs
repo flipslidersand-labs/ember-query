@@ -1,14 +1,13 @@
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    use crate::catalog::TableSchema;
     use crate::executor::join::HashJoinExec;
-    use crate::executor::{build_executor, Executor};
-    use crate::planner::logical::LogicalPlan;
+    use crate::executor::Executor;
+
     use crate::sql::ast::{BinOp, Expr};
 
     fn make_schema(fields: Vec<(&str, DataType)>) -> Arc<Schema> {

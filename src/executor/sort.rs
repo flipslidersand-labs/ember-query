@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
 
 use super::Executor;
 use crate::sql::ast::OrderByItem;
@@ -111,7 +110,7 @@ impl Executor for SortExec {
 }
 
 fn strip_table_prefix(col: &str) -> &str {
-    col.split('.').last().unwrap_or(col)
+    col.split('.').next_back().unwrap_or(col)
 }
 
 fn compare_rows(arr: &ArrayRef, a: usize, b: usize) -> std::cmp::Ordering {

@@ -32,6 +32,7 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right_path: String,
         right_schema: TableSchema,
+        #[allow(dead_code)] // parsed but not yet consumed by the executor
         right_alias: Option<String>,
         on: Expr,
     },
@@ -201,11 +202,9 @@ pub fn build(
 fn collect_aggs(select: &[SelectItem]) -> Vec<(AggFunc, Expr, String)> {
     let mut result = Vec::new();
     for (i, item) in select.iter().enumerate() {
-        if let SelectItem::Expr(expr, alias) = item {
-            if let Expr::Agg { func, expr: arg } = expr {
-                let name = alias.clone().unwrap_or_else(|| format!("agg_{}", i));
-                result.push((func.clone(), *arg.clone(), name));
-            }
+        if let SelectItem::Expr(Expr::Agg { func, expr: arg }, alias) = item {
+            let name = alias.clone().unwrap_or_else(|| format!("agg_{}", i));
+            result.push((func.clone(), *arg.clone(), name));
         }
     }
     result
