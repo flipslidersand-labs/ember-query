@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
-use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{evaluate, evaluate_bool, Executor};
+use super::{evaluate, Executor};
 use crate::sql::ast::Expr;
 
 /// Hash inner join executor.
@@ -30,8 +30,9 @@ impl HashJoinExec {
         on: &Expr,
     ) -> Result<Self> {
         // Extract equality columns from the ON expression
-        let (left_col, right_col) = extract_eq_columns(on)
-            .ok_or_else(|| anyhow!("JOIN ON must be an equality expression (left_col = right_col)"))?;
+        let (left_col, right_col) = extract_eq_columns(on).ok_or_else(|| {
+            anyhow!("JOIN ON must be an equality expression (left_col = right_col)")
+        })?;
 
         // Collect all right batches into a hash map: right_key_value → [row_index, batch_index]
         let mut right_batches: Vec<RecordBatch> = Vec::new();
@@ -165,7 +166,7 @@ fn eval_column_str(batch: &RecordBatch, col: &str) -> Result<ArrayRef> {
         return Ok(arr);
     }
     // Try stripping the table prefix (e.g., "orders.id" → "id")
-    if let Some(unqualified) = col.split('.').last() {
+    if let Some(unqualified) = col.split('.').next_back() {
         if let Ok(arr) = evaluate(batch, &Expr::Column(unqualified.to_string())) {
             return Ok(arr);
         }

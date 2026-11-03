@@ -1,18 +1,16 @@
 pub mod csv_scan;
+pub mod filter;
+pub mod hash_agg;
 pub mod join;
 #[cfg(test)]
 #[path = "join_test.rs"]
 mod join_test;
-pub mod sort;
-pub mod filter;
-pub mod hash_agg;
 pub mod limit;
 pub mod project;
+pub mod sort;
 
 use anyhow::{anyhow, Result};
-use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
-};
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute;
 use arrow::compute::kernels::numeric as numeric_kernels;
 use arrow::datatypes::SchemaRef;
@@ -32,13 +30,22 @@ pub trait Executor {
 /// Evaluate an expression over a `RecordBatch`, returning an `ArrayRef`.
 pub fn evaluate(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
     match expr {
-        Expr::Column(name) => {
-            batch
-                .schema()
-                .index_of(name)
-                .map(|i| batch.column(i).clone())
-                .map_err(|_| anyhow!("column '{}' not found in schema {:?}", name, batch.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>()))
-        }
+        Expr::Column(name) => batch
+            .schema()
+            .index_of(name)
+            .map(|i| batch.column(i).clone())
+            .map_err(|_| {
+                anyhow!(
+                    "column '{}' not found in schema {:?}",
+                    name,
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name())
+                        .collect::<Vec<_>>()
+                )
+            }),
 
         Expr::Literal(val) => make_scalar_array(val, batch.num_rows()),
 
@@ -207,7 +214,9 @@ pub fn build_executor(plan: LogicalPlan) -> Result<Box<dyn Executor>> {
         } => {
             let left_exec = build_executor(*left)?;
             let right_exec = Box::new(csv_scan::CsvScanExec::new(&right_path, right_schema)?);
-            Ok(Box::new(join::HashJoinExec::new(left_exec, right_exec, &on)?))
+            Ok(Box::new(join::HashJoinExec::new(
+                left_exec, right_exec, &on,
+            )?))
         }
         LogicalPlan::Sort { input, order_by } => {
             let child = build_executor(*input)?;

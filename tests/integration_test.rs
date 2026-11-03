@@ -1,5 +1,5 @@
-use arrow::record_batch::RecordBatch;
 use anyhow::Result;
+use arrow::record_batch::RecordBatch;
 use std::path::Path;
 
 fn run_query(csv_path: &str, sql: &str) -> Result<Vec<RecordBatch>> {
@@ -25,10 +25,7 @@ fn sample_csv() -> String {
 #[test]
 fn test_select_star_where_price_limit() -> Result<()> {
     let path = sample_csv();
-    let batches = run_query(
-        &path,
-        "SELECT * FROM data WHERE price > 1000 LIMIT 3",
-    )?;
+    let batches = run_query(&path, "SELECT * FROM data WHERE price > 1000 LIMIT 3")?;
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 3, "expected 3 rows, got {}", total_rows);
@@ -38,13 +35,14 @@ fn test_select_star_where_price_limit() -> Result<()> {
 #[test]
 fn test_select_columns_where_in_stock() -> Result<()> {
     let path = sample_csv();
-    let batches = run_query(
-        &path,
-        "SELECT name, price FROM data WHERE in_stock = true",
-    )?;
+    let batches = run_query(&path, "SELECT name, price FROM data WHERE in_stock = true")?;
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 3, "expected 3 rows (Apple, Banana, Date), got {}", total_rows);
+    assert_eq!(
+        total_rows, 3,
+        "expected 3 rows (Apple, Banana, Date), got {}",
+        total_rows
+    );
     Ok(())
 }
 

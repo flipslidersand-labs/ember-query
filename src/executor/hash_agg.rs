@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use arrow::array::{
-    ArrayRef, Float64Builder, Int64Array, Int64Builder, Float64Array, StringArray, StringBuilder,
+    ArrayRef, Float64Array, Float64Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -123,10 +123,8 @@ impl HashAggExec {
 
             for row in 0..batch.num_rows() {
                 // Build group key
-                let key: Vec<ScalarKey> = group_arrays
-                    .iter()
-                    .map(|arr| scalar_at(arr, row))
-                    .collect();
+                let key: Vec<ScalarKey> =
+                    group_arrays.iter().map(|arr| scalar_at(arr, row)).collect();
 
                 let states = map.entry(key.clone()).or_insert_with(|| {
                     key_order.push(key.clone());
@@ -164,12 +162,7 @@ impl HashAggExec {
         // Group-by columns
         for (col_idx, col_name) in self.group_by.iter().enumerate() {
             let field = self.out_schema.field_with_name(col_name)?;
-            let arr = build_group_column(
-                field.data_type(),
-                &key_order,
-                col_idx,
-                n_rows,
-            )?;
+            let arr = build_group_column(field.data_type(), &key_order, col_idx, n_rows)?;
             columns.push(arr);
         }
 
