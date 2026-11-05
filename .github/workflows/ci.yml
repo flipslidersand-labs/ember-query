@@ -8,6 +8,3 @@ on:
 jobs:
   test:
     uses: flipslidersand-labs/qa-workflows/.github/workflows/rust-test.yml@main
-    with:
-      # 行カバレッジの実測は約 55%(2026-11-03)。既定の 60 に届かないため、実測の下に置く。
-      coverage-threshold: 50
