@@ -134,6 +134,14 @@ fn make_scalar_array(val: &Value, len: usize) -> Result<ArrayRef> {
 
 fn apply_binop(op: &BinOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
     use arrow::compute::kernels::cmp as kcmp;
+    use arrow::datatypes::DataType;
+
+    // Int64 と Float64 の混在は Int64 側を Float64 に揃える(arrow は暗黙変換しない)
+    let (l, r) = match (l.data_type(), r.data_type()) {
+        (DataType::Int64, DataType::Float64) => (&compute::cast(l, &DataType::Float64)?, r),
+        (DataType::Float64, DataType::Int64) => (l, &compute::cast(r, &DataType::Float64)?),
+        _ => (l, r),
+    };
 
     match op {
         // Arithmetic
@@ -222,5 +230,68 @@ pub fn build_executor(plan: LogicalPlan) -> Result<Box<dyn Executor>> {
             let child = build_executor(*input)?;
             Ok(Box::new(sort::SortExec::new(child, order_by)?))
         }
+    }
+}
+
+#[cfg(test)]
+mod binop_mixed_type_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("price", DataType::Float64, false),
+            Field::new("qty", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float64Array::from(vec![5.5, 10.0, 20.25])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
+        Expr::BinOp {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+
+    fn col(n: &str) -> Expr {
+        Expr::Column(n.to_string())
+    }
+
+    #[test]
+    fn float_column_gt_int_literal() {
+        let e = bin(BinOp::Gt, col("price"), Expr::Literal(Value::Int(10)));
+        let got = evaluate_bool(&batch(), &e).unwrap();
+        assert_eq!(got, BooleanArray::from(vec![false, false, true]));
+    }
+
+    #[test]
+    fn int_column_lt_float_literal() {
+        let e = bin(BinOp::Lt, col("qty"), Expr::Literal(Value::Float(1.5)));
+        let got = evaluate_bool(&batch(), &e).unwrap();
+        assert_eq!(got, BooleanArray::from(vec![true, false, false]));
+    }
+
+    #[test]
+    fn float_column_times_int_literal() {
+        let e = bin(BinOp::Mul, col("price"), Expr::Literal(Value::Int(2)));
+        let got = evaluate(&batch(), &e).unwrap();
+        let got = got.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(got, &Float64Array::from(vec![11.0, 20.0, 40.5]));
+    }
+
+    #[test]
+    fn float_column_plus_int_column() {
+        let e = bin(BinOp::Add, col("price"), col("qty"));
+        let got = evaluate(&batch(), &e).unwrap();
+        let got = got.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(got, &Float64Array::from(vec![6.5, 12.0, 23.25]));
     }
 }
