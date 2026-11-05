@@ -132,12 +132,14 @@ impl HashAggExec {
                 });
 
                 // Update each aggregate
-                for (agg_idx, (func, _, _)) in self.aggs.iter().enumerate() {
+                for (agg_idx, (func, expr, _)) in self.aggs.iter().enumerate() {
                     let arr = &agg_arrays[agg_idx];
                     match func {
                         AggFunc::Count => {
-                            // COUNT(*) — arg is Wildcard → BooleanArray of true
-                            states[agg_idx].update_count_only();
+                            // COUNT(*) counts every row; COUNT(col) skips NULLs.
+                            if matches!(expr, Expr::Wildcard) || !arr.is_null(row) {
+                                states[agg_idx].update_count_only();
+                            }
                         }
                         _ => {
                             if let Some(v) = f64_at(arr, row) {
@@ -317,7 +319,11 @@ fn build_agg_column(
             let mut b = Float64Builder::new();
             for key in key_order {
                 let state = &map[key][agg_idx];
-                b.append_value(state.sum);
+                if state.count > 0 {
+                    b.append_value(state.sum);
+                } else {
+                    b.append_null();
+                }
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
@@ -357,5 +363,82 @@ fn build_agg_column(
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockExec {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    }
+
+    impl Executor for MockExec {
+        fn next(&mut self) -> Result<Option<RecordBatch>> {
+            Ok(if self.batches.is_empty() {
+                None
+            } else {
+                Some(self.batches.remove(0))
+            })
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+    }
+
+    fn run_agg(vals: Vec<Option<i64>>, aggs: Vec<(AggFunc, Expr, String)>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batches = if vals.is_empty() {
+            vec![]
+        } else {
+            let arr: Int64Array = vals.into_iter().collect();
+            vec![RecordBatch::try_new(schema.clone(), vec![Arc::new(arr) as ArrayRef]).unwrap()]
+        };
+        let input = Box::new(MockExec { schema, batches });
+        let mut exec = HashAggExec::new(input, vec![], aggs).unwrap();
+        exec.next().unwrap().unwrap()
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(name.to_string())
+    }
+
+    #[test]
+    fn count_column_skips_nulls_but_count_star_does_not() {
+        let out = run_agg(
+            vec![Some(1), None, Some(3)],
+            vec![
+                (AggFunc::Count, col("v"), "c".into()),
+                (AggFunc::Count, Expr::Wildcard, "s".into()),
+            ],
+        );
+        let c = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let s = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(c.value(0), 2);
+        assert_eq!(s.value(0), 3);
+    }
+
+    #[test]
+    fn sum_is_null_for_zero_rows_and_all_null() {
+        for vals in [vec![], vec![None, None]] {
+            let out = run_agg(vals, vec![(AggFunc::Sum, col("v"), "t".into())]);
+            assert!(out.column(0).is_null(0));
+        }
+    }
+
+    #[test]
+    fn sum_ignores_nulls() {
+        let out = run_agg(
+            vec![Some(1), None, Some(3)],
+            vec![(AggFunc::Sum, col("v"), "t".into())],
+        );
+        let t = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(t.value(0), 4.0);
     }
 }
