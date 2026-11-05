@@ -32,8 +32,6 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right_path: String,
         right_schema: TableSchema,
-        #[allow(dead_code)] // parsed but not yet consumed by the executor
-        right_alias: Option<String>,
         on: Expr,
     },
     /// Sort output rows by one or more columns.
@@ -149,7 +147,6 @@ pub fn build(
             left: Box::new(plan),
             right_path,
             right_schema,
-            right_alias: join.alias.clone(),
             on: join.on.clone(),
         };
     }

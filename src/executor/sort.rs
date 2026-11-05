@@ -142,3 +142,117 @@ fn take_rows(arr: &ArrayRef, indices: &[usize]) -> Result<ArrayRef> {
     let take_indices: arrow::array::Int64Array = indices.iter().map(|&i| Some(i as i64)).collect();
     Ok(arrow::compute::take(arr.as_ref(), &take_indices, None)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    struct VecExec {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    }
+
+    impl Executor for VecExec {
+        fn next(&mut self) -> Result<Option<RecordBatch>> {
+            Ok(if self.batches.is_empty() {
+                None
+            } else {
+                Some(self.batches.remove(0))
+            })
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("price", DataType::Float64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    fn batch(ids: Vec<Option<i64>>, prices: Vec<f64>, names: Vec<&str>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Float64Array::from(prices)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn sorted(batches: Vec<RecordBatch>, order: Vec<(&str, bool)>) -> Result<Vec<RecordBatch>> {
+        let input = Box::new(VecExec {
+            schema: schema(),
+            batches,
+        });
+        let order_by = order
+            .into_iter()
+            .map(|(c, asc)| OrderByItem {
+                column: c.to_string(),
+                asc,
+            })
+            .collect();
+        let mut exec = SortExec::new(input, order_by)?;
+        let mut out = vec![];
+        while let Some(b) = exec.next()? {
+            out.push(b);
+        }
+        Ok(out)
+    }
+
+    fn ids(out: &[RecordBatch]) -> Vec<Option<i64>> {
+        let a = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        (0..a.len())
+            .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+            .collect()
+    }
+
+    #[test]
+    fn sorts_int_ascending_across_batches_with_nulls_last() {
+        let b1 = batch(vec![Some(3), None], vec![1.0, 2.0], vec!["c", "n"]);
+        let b2 = batch(vec![Some(1), Some(2)], vec![3.0, 4.0], vec!["a", "b"]);
+        let out = sorted(vec![b1, b2], vec![("id", true)]).unwrap();
+        assert_eq!(ids(&out), vec![Some(1), Some(2), Some(3), None]);
+    }
+
+    #[test]
+    fn sorts_descending_with_table_prefix() {
+        let b = batch(vec![Some(1), Some(3), Some(2)], vec![0.0; 3], vec!["a"; 3]);
+        let out = sorted(vec![b], vec![("t.id", false)]).unwrap();
+        assert_eq!(ids(&out), vec![Some(3), Some(2), Some(1)]);
+    }
+
+    #[test]
+    fn sorts_by_float_then_string_tiebreak() {
+        let b = batch(
+            vec![Some(1), Some(2), Some(3)],
+            vec![2.0, 1.0, 1.0],
+            vec!["x", "z", "y"],
+        );
+        let out = sorted(vec![b], vec![("price", true), ("name", true)]).unwrap();
+        assert_eq!(ids(&out), vec![Some(3), Some(2), Some(1)]);
+    }
+
+    #[test]
+    fn empty_input_yields_no_batches() {
+        assert!(sorted(vec![], vec![("id", true)]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_column_errors() {
+        let b = batch(vec![Some(1)], vec![0.0], vec!["a"]);
+        let err = sorted(vec![b], vec![("nope", true)]).err().unwrap();
+        assert!(err.to_string().contains("not found"));
+    }
+}
