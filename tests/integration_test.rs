@@ -287,10 +287,40 @@ fn test_agg_compound_expression_is_unsupported_error() {
 
 #[test]
 fn test_agg_order_by_unselected_group_column_still_works() -> Result<()> {
-    let batches = run_query(
-        &fixture("orders.csv"),
-        "SELECT COUNT(*) FROM orders GROUP BY region ORDER BY region DESC LIMIT 1",
-    )?;
-    assert_eq!(rows_of(&batches), strs(&[&["3"]]));
+    // Excluding order 105 makes the groups differ in size (east 2, west 3),
+    // so ASC and DESC give different results.
+    let sql = |dir: &str| {
+        format!(
+            "SELECT COUNT(*) FROM orders WHERE order_id != 105 GROUP BY region ORDER BY region {dir}"
+        )
+    };
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &sql("DESC"))?),
+        strs(&[&["3"], &["2"]])
+    );
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &sql("ASC"))?),
+        strs(&[&["2"], &["3"]])
+    );
     Ok(())
+}
+
+#[test]
+fn test_agg_alias_colliding_with_group_column_is_error() {
+    let res = run_query(
+        &fixture("orders.csv"),
+        "SELECT COUNT(*) AS region, region FROM orders GROUP BY region",
+    );
+    let err = res.expect_err("duplicate aggregate output name must be an error");
+    assert!(err.to_string().contains("duplicate"), "{err}");
+}
+
+#[test]
+fn test_agg_alias_colliding_with_auto_name_is_error() {
+    let res = run_query(
+        &fixture("orders.csv"),
+        "SELECT COUNT(*) AS agg_1, SUM(qty) FROM orders",
+    );
+    let err = res.expect_err("duplicate aggregate output name must be an error");
+    assert!(err.to_string().contains("duplicate"), "{err}");
 }
