@@ -143,11 +143,10 @@ impl ColBuilder {
                 if val.is_empty() {
                     b.append_null();
                 } else {
-                    match val.to_lowercase().as_str() {
-                        "true" | "1" | "yes" => b.append_value(true),
-                        "false" | "0" | "no" => b.append_value(false),
-                        _ => b.append_null(),
-                    }
+                    b.append_value(
+                        crate::catalog::parse_bool_str(val)
+                            .ok_or_else(|| anyhow!("cannot parse '{}' as bool", val))?,
+                    );
                 }
             }
             ColBuilder::Str(b) => {
@@ -344,8 +343,8 @@ mod tests {
     }
 
     #[test]
-    fn bool_column_accepts_true_false_case_insensitive_and_numeric() {
-        let f = TmpCsv::new("b\nTrue\nFALSE\n1\n0\nyes\nno\n");
+    fn bool_column_accepts_true_false_case_insensitive() {
+        let f = TmpCsv::new("b\nTrue\nFALSE\ntrue\n\n");
         let batches = scan_all(&f, schema_of(&[("b", DataType::Boolean)])).unwrap();
         let a = batches[0]
             .column(0)
@@ -355,26 +354,28 @@ mod tests {
         let got: Vec<Option<bool>> = (0..a.len())
             .map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
             .collect();
-        assert_eq!(
-            got,
-            vec![
-                Some(true),
-                Some(false),
-                Some(true),
-                Some(false),
-                Some(true),
-                Some(false)
-            ]
-        );
+        assert_eq!(got, vec![Some(true), Some(false), Some(true)]);
     }
 
     #[test]
-    fn bool_column_invalid_value_becomes_null() {
-        // Current behaviour: unparsable bool -> NULL (unlike Int/Float, which error).
-        let f = TmpCsv::new("b\ntrue\nmaybe\n");
-        let batches = scan_all(&f, schema_of(&[("b", DataType::Boolean)])).unwrap();
+    fn bool_column_rejects_non_true_false_notations() {
+        for bad in ["maybe", "1", "0", "yes", "no"] {
+            let f = TmpCsv::new(&format!("b\ntrue\n{}\n", bad));
+            let err = scan_all(&f, schema_of(&[("b", DataType::Boolean)])).unwrap_err();
+            assert!(err.to_string().contains(bad), "{}: got {}", bad, err);
+        }
+    }
+
+    #[test]
+    fn bool_column_empty_cell_is_null() {
+        let f = TmpCsv::new("a,b\n1,true\n2,\n");
+        let batches = scan_all(
+            &f,
+            schema_of(&[("a", DataType::Int64), ("b", DataType::Boolean)]),
+        )
+        .unwrap();
         let a = batches[0]
-            .column(0)
+            .column(1)
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();

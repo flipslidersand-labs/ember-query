@@ -51,8 +51,17 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
     Ok(TableSchema { columns })
 }
 
+/// Bool として受理する表記は `true`/`false`(大文字小文字不問)のみ。型推論とスキャンで共通。
+pub(crate) fn parse_bool_str(s: &str) -> Option<bool> {
+    match s.to_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn is_strict_bool_str(s: &str) -> bool {
-    matches!(s.to_lowercase().as_str(), "true" | "false")
+    parse_bool_str(s).is_some()
 }
 
 fn infer_column_type(samples: &[Vec<String>], col_idx: usize) -> DataType {
