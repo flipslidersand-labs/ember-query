@@ -40,13 +40,14 @@ impl HashJoinExec {
             right_batches.push(rb);
         }
 
-        // Build hash map: string-key → Vec<(batch_idx, row_idx)>
-        let mut build_map: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        // Build hash map: typed key → Vec<(batch_idx, row_idx)>. NULL keys are skipped.
+        let mut build_map: HashMap<JoinKey, Vec<(usize, usize)>> = HashMap::new();
         for (b_idx, batch) in right_batches.iter().enumerate() {
             let key_arr = eval_column_str(batch, &right_col)?;
             for r_idx in 0..batch.num_rows() {
-                let key = array_value_str(&key_arr, r_idx);
-                build_map.entry(key).or_default().push((b_idx, r_idx));
+                if let Some(key) = join_key(&key_arr, r_idx)? {
+                    build_map.entry(key).or_default().push((b_idx, r_idx));
+                }
             }
         }
 
@@ -65,7 +66,9 @@ impl HashJoinExec {
             let mut matched_right_row_indices: Vec<usize> = Vec::new();
 
             for l_row in 0..left_batch.num_rows() {
-                let key = array_value_str(&probe_arr, l_row);
+                let Some(key) = join_key(&probe_arr, l_row)? else {
+                    continue; // NULL never matches
+                };
                 if let Some(matches) = build_map.get(&key) {
                     for &(rb_idx, rr_idx) in matches {
                         matched_left_indices.push(l_row);
@@ -174,24 +177,43 @@ fn eval_column_str(batch: &RecordBatch, col: &str) -> Result<ArrayRef> {
     Err(anyhow!("column '{}' not found in batch", col))
 }
 
-fn array_value_str(arr: &ArrayRef, idx: usize) -> String {
+/// Typed join key: values of different types never compare equal.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum JoinKey {
+    Int(i64),
+    /// Normalised bits (-0.0 → 0.0, all NaNs → one NaN)
+    Float(u64),
+    Str(String),
+    Bool(bool),
+}
+
+/// Returns `None` for NULL (SQL: NULL matches nothing).
+fn join_key(arr: &ArrayRef, idx: usize) -> Result<Option<JoinKey>> {
     use arrow::array::*;
     if arr.is_null(idx) {
-        return "NULL".to_string();
+        return Ok(None);
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return a.value(idx).to_string();
+        return Ok(Some(JoinKey::Int(a.value(idx))));
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return a.value(idx).to_string();
+        let v = a.value(idx);
+        let v = if v.is_nan() {
+            f64::NAN
+        } else if v == 0.0 {
+            0.0
+        } else {
+            v
+        };
+        return Ok(Some(JoinKey::Float(v.to_bits())));
     }
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return a.value(idx).to_string();
+        return Ok(Some(JoinKey::Str(a.value(idx).to_string())));
     }
     if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-        return a.value(idx).to_string();
+        return Ok(Some(JoinKey::Bool(a.value(idx))));
     }
-    format!("{:?}[{}]", arr.data_type(), idx)
+    Err(anyhow!("unsupported JOIN key type: {:?}", arr.data_type()))
 }
 
 fn merge_schemas(left: &Schema, right: &Schema) -> Schema {
