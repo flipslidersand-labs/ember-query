@@ -387,3 +387,91 @@ fn parse_literal_expr(pair: Pair<Rule>) -> Result<Expr> {
     };
     Ok(Expr::Literal(val))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(s: &str) -> Box<Expr> {
+        Box::new(Expr::Column(s.to_string()))
+    }
+
+    fn eq(c: &str, n: i64) -> Expr {
+        Expr::BinOp {
+            op: BinOp::Eq,
+            left: col(c),
+            right: Box::new(Expr::Literal(Value::Int(n))),
+        }
+    }
+
+    #[test]
+    fn where_followed_by_order_by_parses() {
+        let s = parse("SELECT * FROM orders WHERE qty > 1 ORDER BY qty").unwrap();
+        assert!(s.where_.is_some());
+        assert_eq!(s.order_by.len(), 1);
+        assert_eq!(s.order_by[0].column, "qty");
+    }
+
+    #[test]
+    fn join_on_followed_by_order_by_parses() {
+        let s = parse("SELECT * FROM a JOIN b ON a.id = b.id ORDER BY a.id DESC").unwrap();
+        assert_eq!(s.joins.len(), 1);
+        assert_eq!(s.order_by.len(), 1);
+        assert!(!s.order_by[0].asc);
+    }
+
+    #[test]
+    fn or_and_precedence_unchanged() {
+        let s = parse("SELECT * FROM t WHERE a = 1 OR b = 2 AND c = 3").unwrap();
+        let expected = Expr::BinOp {
+            op: BinOp::Or,
+            left: Box::new(eq("a", 1)),
+            right: Box::new(Expr::BinOp {
+                op: BinOp::And,
+                left: Box::new(eq("b", 2)),
+                right: Box::new(eq("c", 3)),
+            }),
+        };
+        assert_eq!(s.where_.unwrap(), expected);
+    }
+
+    #[test]
+    fn keyword_followed_by_paren_or_space_still_works() {
+        let s = parse("SELECT * FROM t WHERE NOT(a = 1) OR(b = 2) AND  c = 3").unwrap();
+        assert!(s.where_.is_some());
+    }
+
+    #[test]
+    fn identifiers_starting_with_keywords_are_columns() {
+        let s = parse(
+            "SELECT order_id, notes, nullable, true_flag, android FROM t \
+             WHERE order_id = 1 OR notes = 2 AND android = 3 ORDER BY order_id",
+        )
+        .unwrap();
+        assert_eq!(s.select.len(), 5);
+        assert_eq!(
+            s.select[1],
+            SelectItem::Expr(Expr::Column("notes".into()), None)
+        );
+        assert_eq!(
+            s.select[2],
+            SelectItem::Expr(Expr::Column("nullable".into()), None)
+        );
+        assert_eq!(
+            s.select[3],
+            SelectItem::Expr(Expr::Column("true_flag".into()), None)
+        );
+        assert_eq!(s.order_by[0].column, "order_id");
+    }
+
+    #[test]
+    fn alias_and_sort_direction_keywords_need_boundary() {
+        let s = parse("SELECT a AS b FROM t ORDER BY a ASC LIMIT 3").unwrap();
+        assert_eq!(
+            s.select[0],
+            SelectItem::Expr(Expr::Column("a".into()), Some("b".into()))
+        );
+        assert!(s.order_by[0].asc);
+        assert_eq!(s.limit, Some(3));
+    }
+}

@@ -2,12 +2,55 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT    = _{ "--" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
 
+// Keywords require a word boundary: the keyword must not be followed by an
+// identifier character (so `OR` does not match the head of `ORDER`/`order_id`).
+// KW_X is silent and consumes only the keyword; the boundary is checked by the
+// atomic lookahead `X_END` (an atomic rule avoids implicit whitespace skipping).
+KW_SELECT = _{ &SELECT_END ~ ^"SELECT" }
+SELECT_END = @{ ^"SELECT" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_FROM = _{ &FROM_END ~ ^"FROM" }
+FROM_END = @{ ^"FROM" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_AS = _{ &AS_END ~ ^"AS" }
+AS_END = @{ ^"AS" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_INNER = _{ &INNER_END ~ ^"INNER" }
+INNER_END = @{ ^"INNER" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_JOIN = _{ &JOIN_END ~ ^"JOIN" }
+JOIN_END = @{ ^"JOIN" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_ON = _{ &ON_END ~ ^"ON" }
+ON_END = @{ ^"ON" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_WHERE = _{ &WHERE_END ~ ^"WHERE" }
+WHERE_END = @{ ^"WHERE" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_GROUP = _{ &GROUP_END ~ ^"GROUP" }
+GROUP_END = @{ ^"GROUP" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_BY = _{ &BY_END ~ ^"BY" }
+BY_END = @{ ^"BY" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_ORDER = _{ &ORDER_END ~ ^"ORDER" }
+ORDER_END = @{ ^"ORDER" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_ASC = _{ &ASC_END ~ ^"ASC" }
+ASC_END = @{ ^"ASC" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_DESC = _{ &DESC_END ~ ^"DESC" }
+DESC_END = @{ ^"DESC" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_LIMIT = _{ &LIMIT_END ~ ^"LIMIT" }
+LIMIT_END = @{ ^"LIMIT" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_OR = _{ &OR_END ~ ^"OR" }
+OR_END = @{ ^"OR" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_AND = _{ &AND_END ~ ^"AND" }
+AND_END = @{ ^"AND" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_NOT = _{ &NOT_END ~ ^"NOT" }
+NOT_END = @{ ^"NOT" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_NULL = _{ &NULL_END ~ ^"NULL" }
+NULL_END = @{ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_TRUE = _{ &TRUE_END ~ ^"TRUE" }
+TRUE_END = @{ ^"TRUE" ~ !(ASCII_ALPHANUMERIC | "_") }
+KW_FALSE = _{ &FALSE_END ~ ^"FALSE" }
+FALSE_END = @{ ^"FALSE" ~ !(ASCII_ALPHANUMERIC | "_") }
+
 // Top-level rule
 query = { SOI ~ select_stmt ~ ";"? ~ EOI }
 
 select_stmt = {
-    ^"SELECT" ~ select_list
-    ~ ^"FROM" ~ table_ref
+    KW_SELECT ~ select_list
+    ~ KW_FROM ~ table_ref
     ~ join_clause*
     ~ where_clause?
     ~ group_by_clause?
@@ -18,36 +61,36 @@ select_stmt = {
 // SELECT list
 select_list = { select_item ~ ("," ~ select_item)* }
 select_item = { wildcard | aliased_expr }
-aliased_expr = { expr ~ (^"AS" ~ ident)? }
+aliased_expr = { expr ~ (KW_AS ~ ident)? }
 wildcard = { "*" }
 
 // FROM clause — table with optional alias
-table_ref = { table_name ~ (^"AS" ~ table_alias)? }
+table_ref = { table_name ~ (KW_AS ~ table_alias)? }
 table_name  = @{ ident }
 table_alias = @{ ident }
 
 // JOIN clause (INNER JOIN only for Phase 5)
-join_clause = { (^"INNER" ~ ^"JOIN" | ^"JOIN") ~ table_ref ~ ^"ON" ~ expr }
+join_clause = { (KW_INNER ~ KW_JOIN | KW_JOIN) ~ table_ref ~ KW_ON ~ expr }
 
 // WHERE clause
-where_clause = { ^"WHERE" ~ expr }
+where_clause = { KW_WHERE ~ expr }
 
 // GROUP BY clause
-group_by_clause = { ^"GROUP" ~ ^"BY" ~ ident ~ ("," ~ ident)* }
+group_by_clause = { KW_GROUP ~ KW_BY ~ ident ~ ("," ~ ident)* }
 
 // ORDER BY clause
-order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_item ~ ("," ~ order_item)* }
-order_item = { column_ref ~ (^"ASC" | ^"DESC")? }
+order_by_clause = { KW_ORDER ~ KW_BY ~ order_item ~ ("," ~ order_item)* }
+order_item = { column_ref ~ (KW_ASC | KW_DESC)? }
 
 // LIMIT clause
-limit_clause = { ^"LIMIT" ~ integer }
+limit_clause = { KW_LIMIT ~ integer }
 
 // Expressions — precedence climbing
 expr = { or_expr }
 
-or_expr  = { and_expr  ~ (^"OR"  ~ and_expr)* }
-and_expr = { not_expr  ~ (^"AND" ~ not_expr)* }
-not_expr = { (^"NOT" ~ not_expr) | cmp_expr }
+or_expr  = { and_expr  ~ (KW_OR  ~ and_expr)* }
+and_expr = { not_expr  ~ (KW_AND ~ not_expr)* }
+not_expr = { (KW_NOT ~ not_expr) | cmp_expr }
 
 cmp_expr = { add_expr ~ (cmp_op ~ add_expr)? }
 cmp_op   = { "<>" | "<=" | ">=" | "!=" | "<" | ">" | "=" }
@@ -82,8 +125,8 @@ ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 // Literals
 literal = { null_lit | bool_lit | float_lit | integer_lit | string_lit }
 
-null_lit    = { ^"NULL" }
-bool_lit    = { ^"TRUE" | ^"FALSE" }
+null_lit    = { KW_NULL }
+bool_lit    = { KW_TRUE | KW_FALSE }
 float_lit   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* }
 integer_lit = @{ "-"? ~ ASCII_DIGIT+ }
 string_lit  = @{ "'" ~ (!"'" ~ ANY)* ~ "'" | "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
