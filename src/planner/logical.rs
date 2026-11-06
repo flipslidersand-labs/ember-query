@@ -206,3 +206,217 @@ fn collect_aggs(select: &[SelectItem]) -> Vec<(AggFunc, Expr, String)> {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::ColumnDef;
+    use crate::sql::parser::parse;
+    use arrow::datatypes::DataType;
+    use std::collections::HashMap;
+
+    fn schema(cols: &[(&str, DataType)]) -> TableSchema {
+        TableSchema {
+            columns: cols
+                .iter()
+                .map(|(n, t)| ColumnDef {
+                    name: n.to_string(),
+                    data_type: t.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn main_schema() -> TableSchema {
+        schema(&[("id", DataType::Int64), ("name", DataType::Utf8)])
+    }
+
+    fn catalog() -> HashMap<String, (String, TableSchema)> {
+        let mut c = HashMap::new();
+        c.insert(
+            "b".to_string(),
+            ("b.csv".to_string(), schema(&[("id", DataType::Int64)])),
+        );
+        c.insert(
+            "c".to_string(),
+            ("c.csv".to_string(), schema(&[("id", DataType::Int64)])),
+        );
+        c
+    }
+
+    fn plan(sql: &str) -> Result<LogicalPlan> {
+        build(&parse(sql).unwrap(), "a.csv", main_schema(), &catalog())
+    }
+
+    /// Node names from the root down to the Scan.
+    fn shape(p: &LogicalPlan) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let mut cur = p;
+        loop {
+            let (name, next) = match cur {
+                LogicalPlan::Scan { .. } => ("Scan", None),
+                LogicalPlan::Filter { input, .. } => ("Filter", Some(input)),
+                LogicalPlan::Project { input, .. } => ("Project", Some(input)),
+                LogicalPlan::Limit { input, .. } => ("Limit", Some(input)),
+                LogicalPlan::Aggregate { input, .. } => ("Aggregate", Some(input)),
+                LogicalPlan::Join { left, .. } => ("Join", Some(left)),
+                LogicalPlan::Sort { input, .. } => ("Sort", Some(input)),
+            };
+            out.push(name);
+            match next {
+                Some(n) => cur = n,
+                None => return out,
+            }
+        }
+    }
+
+    #[test]
+    fn full_non_aggregate_node_order() {
+        let p = plan("SELECT id FROM a JOIN b ON a.id = b.id WHERE id > 1 ORDER BY id LIMIT 5")
+            .unwrap();
+        assert_eq!(
+            shape(&p),
+            vec!["Limit", "Sort", "Project", "Filter", "Join", "Scan"]
+        );
+    }
+
+    #[test]
+    fn minimal_select_is_project_over_scan() {
+        let p = plan("SELECT id FROM a").unwrap();
+        assert_eq!(shape(&p), vec!["Project", "Scan"]);
+    }
+
+    #[test]
+    fn aggregate_replaces_project() {
+        let p = plan("SELECT COUNT(*) FROM a WHERE id > 1 ORDER BY agg_0 LIMIT 1").unwrap();
+        assert_eq!(
+            shape(&p),
+            vec!["Limit", "Sort", "Aggregate", "Filter", "Scan"]
+        );
+    }
+
+    #[test]
+    fn group_by_without_aggregates_is_aggregate_with_no_aggs() {
+        let p = plan("SELECT name FROM a GROUP BY name").unwrap();
+        assert_eq!(shape(&p), vec!["Aggregate", "Scan"]);
+        match p {
+            LogicalPlan::Aggregate { group_by, aggs, .. } => {
+                assert_eq!(group_by, vec!["name".to_string()]);
+                assert!(aggs.is_empty());
+            }
+            other => panic!("expected Aggregate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn agg_names_use_select_position_and_alias() {
+        // Position index counts every SELECT item, including non-aggregates.
+        let p = plan("SELECT COUNT(*), SUM(id) AS total, MAX(id) FROM a").unwrap();
+        match p {
+            LogicalPlan::Aggregate { aggs, .. } => {
+                let names: Vec<&str> = aggs.iter().map(|(_, _, n)| n.as_str()).collect();
+                assert_eq!(names, vec!["agg_0", "total", "agg_2"]);
+                assert_eq!(aggs[0].0, AggFunc::Count);
+                assert_eq!(aggs[0].1, Expr::Wildcard);
+                assert_eq!(aggs[1].0, AggFunc::Sum);
+                assert_eq!(aggs[1].1, Expr::Column("id".to_string()));
+                assert_eq!(aggs[2].0, AggFunc::Max);
+            }
+            other => panic!("expected Aggregate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auto_name_index_is_position_in_select_list() {
+        let p = plan("SELECT name, COUNT(*) FROM a GROUP BY name").unwrap();
+        match p {
+            LogicalPlan::Aggregate { aggs, .. } => {
+                assert_eq!(aggs.len(), 1);
+                assert_eq!(aggs[0].2, "agg_1");
+            }
+            other => panic!("expected Aggregate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multiple_joins_nest_in_source_order() {
+        let p = plan("SELECT id FROM a JOIN b ON a.id = b.id JOIN c ON a.id = c.id").unwrap();
+        assert_eq!(shape(&p), vec!["Project", "Join", "Join", "Scan"]);
+        let LogicalPlan::Project { input, .. } = p else {
+            panic!("expected Project");
+        };
+        // Outermost join is the last one written (c); inner is b.
+        let LogicalPlan::Join {
+            left, right_path, ..
+        } = *input
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(right_path, "c.csv");
+        match *left {
+            LogicalPlan::Join { right_path, .. } => assert_eq!(right_path, "b.csv"),
+            other => panic!("expected inner Join, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn join_resolves_right_schema_from_catalog() {
+        let p = plan("SELECT id FROM a JOIN b ON a.id = b.id").unwrap();
+        let LogicalPlan::Project { input, .. } = p else {
+            panic!("expected Project");
+        };
+        match *input {
+            LogicalPlan::Join {
+                right_path,
+                right_schema,
+                ..
+            } => {
+                assert_eq!(right_path, "b.csv");
+                assert_eq!(right_schema.columns.len(), 1);
+                assert_eq!(right_schema.columns[0].name, "id");
+            }
+            other => panic!("expected Join, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn missing_join_table_is_error() {
+        let err = plan("SELECT id FROM a JOIN nope ON a.id = nope.id").unwrap_err();
+        assert_eq!(err.to_string(), "JOIN table 'nope' not found in catalog");
+    }
+
+    #[test]
+    fn explain_simple_plan_format() {
+        let p = plan("SELECT id FROM a ORDER BY id DESC, name LIMIT 3").unwrap();
+        let expected = "Limit [3]\n  \
+                        Sort [\"id DESC, name ASC\"]\n    \
+                        Project [1 exprs]\n      \
+                        Scan [a.csv] columns=[id:Int64, name:Utf8]";
+        assert_eq!(p.explain(0), expected);
+    }
+
+    #[test]
+    fn explain_aggregate_and_join_format() {
+        let p =
+            plan("SELECT name, COUNT(*) AS n FROM a JOIN b ON a.id = b.id GROUP BY name").unwrap();
+        let out = p.explain(0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "Aggregate [group_by=[\"name\"], aggs=Count(Wildcard) AS n]"
+        );
+        assert!(
+            lines[1].starts_with("  Join [right=b.csv, on="),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(lines[2], "    Scan [a.csv] columns=[id:Int64, name:Utf8]");
+    }
+
+    #[test]
+    fn explain_indents_by_depth() {
+        let p = plan("SELECT id FROM a").unwrap();
+        assert!(p.explain(2).starts_with("    Project"));
+    }
+}
