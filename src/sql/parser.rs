@@ -611,4 +611,210 @@ mod tests {
         assert!(!s.order_by[0].asc);
         assert_eq!(s.order_by[0].column, "x");
     }
+
+    // ---- Issue #45: expression parsing and invalid input ----
+
+    fn lit(v: Value) -> Box<Expr> {
+        Box::new(Expr::Literal(v))
+    }
+
+    fn bin(op: BinOp, l: Box<Expr>, r: Box<Expr>) -> Box<Expr> {
+        Box::new(Expr::BinOp {
+            op,
+            left: l,
+            right: r,
+        })
+    }
+
+    /// Parses `SELECT <e> FROM t` and returns the single select expression.
+    fn sel(e: &str) -> Expr {
+        let s = parse(&format!("SELECT {e} FROM t")).unwrap();
+        assert_eq!(s.select.len(), 1);
+        match s.select.into_iter().next().unwrap() {
+            SelectItem::Expr(x, None) => x,
+            other => panic!("unexpected select item: {other:?}"),
+        }
+    }
+
+    fn where_of(cond: &str) -> Expr {
+        parse(&format!("SELECT * FROM t WHERE {cond}"))
+            .unwrap()
+            .where_
+            .unwrap()
+    }
+
+    #[test]
+    fn subtraction_is_left_associative() {
+        let expected = *bin(BinOp::Sub, bin(BinOp::Sub, col("a"), col("b")), col("c"));
+        assert_eq!(sel("a - b - c"), expected);
+    }
+
+    #[test]
+    fn division_is_left_associative() {
+        let expected = *bin(BinOp::Div, bin(BinOp::Div, col("a"), col("b")), col("c"));
+        assert_eq!(sel("a / b / c"), expected);
+    }
+
+    #[test]
+    fn mul_binds_tighter_than_add() {
+        let expected = *bin(BinOp::Add, col("a"), bin(BinOp::Mul, col("b"), col("c")));
+        assert_eq!(sel("a + b * c"), expected);
+        let expected = *bin(BinOp::Add, bin(BinOp::Mul, col("a"), col("b")), col("c"));
+        assert_eq!(sel("a * b + c"), expected);
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        let expected = *bin(BinOp::Mul, bin(BinOp::Add, col("a"), col("b")), col("c"));
+        assert_eq!(sel("(a + b) * c"), expected);
+    }
+
+    #[test]
+    fn comparison_binds_looser_than_arithmetic() {
+        let expected = *bin(
+            BinOp::Gt,
+            bin(BinOp::Add, col("a"), col("b")),
+            lit(Value::Int(1)),
+        );
+        assert_eq!(where_of("a + b > 1"), expected);
+    }
+
+    #[test]
+    #[ignore = "bug: parse_unary_expr checks first.as_str() == \"-\" but the anonymous \"-\" token yields no pair, so unary minus is silently dropped (-x parses as x)"]
+    fn unary_minus_on_column() {
+        let expected = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: col("x"),
+        };
+        assert_eq!(sel("-x"), expected);
+    }
+
+    #[test]
+    fn double_not_nests() {
+        let expected = Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: col("a"),
+            }),
+        };
+        assert_eq!(where_of("NOT NOT a"), expected);
+    }
+
+    #[test]
+    fn single_not_wraps_comparison() {
+        let expected = Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(eq("a", 1)),
+        };
+        assert_eq!(where_of("NOT a = 1"), expected);
+    }
+
+    #[test]
+    fn string_literal_quotes_are_stripped() {
+        let expected = *bin(BinOp::Eq, col("name"), lit(Value::Str("it".into())));
+        assert_eq!(where_of("name = 'it'"), expected);
+        assert_eq!(where_of("name = \"it\""), expected);
+    }
+
+    #[test]
+    fn empty_string_literal() {
+        assert_eq!(sel("''"), Expr::Literal(Value::Str(String::new())));
+    }
+
+    #[test]
+    fn scalar_literals() {
+        assert_eq!(sel("42"), Expr::Literal(Value::Int(42)));
+        assert_eq!(sel("2.5"), Expr::Literal(Value::Float(2.5)));
+        assert_eq!(sel("TRUE"), Expr::Literal(Value::Bool(true)));
+        assert_eq!(sel("false"), Expr::Literal(Value::Bool(false)));
+        assert_eq!(sel("NULL"), Expr::Literal(Value::Null));
+        assert_eq!(sel("null"), Expr::Literal(Value::Null));
+    }
+
+    #[test]
+    fn count_star() {
+        let expected = Expr::Agg {
+            func: AggFunc::Count,
+            expr: Box::new(Expr::Wildcard),
+        };
+        assert_eq!(sel("COUNT(*)"), expected);
+    }
+
+    #[test]
+    fn aggregate_name_is_case_insensitive() {
+        let expected = Expr::Agg {
+            func: AggFunc::Sum,
+            expr: col("x"),
+        };
+        assert_eq!(sel("sum(x)"), expected);
+        assert_eq!(sel("SUM(x)"), expected);
+        assert_eq!(sel("Sum(x)"), expected);
+    }
+
+    #[test]
+    fn unknown_function_is_error() {
+        assert!(parse("SELECT FOO(x) FROM t").is_err());
+    }
+
+    #[test]
+    fn limit_value_is_parsed() {
+        let s = parse("SELECT * FROM t LIMIT 10").unwrap();
+        assert_eq!(s.limit, Some(10));
+        let s = parse(&format!("SELECT * FROM t LIMIT {}", u64::MAX)).unwrap();
+        assert_eq!(s.limit, Some(u64::MAX));
+    }
+
+    #[test]
+    fn limit_overflow_is_error() {
+        assert!(parse("SELECT * FROM t LIMIT 99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn negative_limit_is_error() {
+        assert!(parse("SELECT * FROM t LIMIT -1").is_err());
+    }
+
+    #[test]
+    fn empty_and_blank_input_is_error() {
+        assert!(parse("").is_err());
+        assert!(parse("   \n").is_err());
+    }
+
+    #[test]
+    fn select_without_columns_is_error() {
+        assert!(parse("SELECT FROM").is_err());
+        assert!(parse("SELECT FROM t").is_err());
+    }
+
+    #[test]
+    fn missing_from_is_error() {
+        assert!(parse("SELECT a").is_err());
+        assert!(parse("SELECT * WHERE a = 1").is_err());
+    }
+
+    #[test]
+    fn missing_table_name_is_error() {
+        assert!(parse("SELECT * FROM").is_err());
+    }
+
+    #[test]
+    fn group_by_multiple_columns() {
+        let s = parse("SELECT a, b FROM t GROUP BY a, b").unwrap();
+        assert_eq!(s.group_by, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn from_alias_with_as_is_discarded() {
+        let s = parse("SELECT * FROM t AS x").unwrap();
+        assert_eq!(s.select, vec![SelectItem::Wildcard]);
+        assert!(s.joins.is_empty());
+    }
+
+    #[test]
+    #[ignore = "bug: grammar requires AS for table alias, so `FROM t x` is a parse error (Issue #45 expects alias to be accepted and discarded)"]
+    fn from_alias_without_as_is_discarded() {
+        let s = parse("SELECT * FROM t x").unwrap();
+        assert_eq!(s.select, vec![SelectItem::Wildcard]);
+    }
 }
