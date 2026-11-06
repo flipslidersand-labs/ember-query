@@ -172,6 +172,7 @@ pub fn build(
         .any(|i| matches!(i, SelectItem::Expr(e, _) if contains_agg(e)));
     if !aggs.is_empty() || !stmt.group_by.is_empty() || nested_agg {
         agg_project = Some(agg_select_list(&stmt.select, &stmt.group_by)?);
+        check_unique_agg_outputs(&stmt.group_by, &aggs)?;
         plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
             group_by: stmt.group_by.clone(),
@@ -233,6 +234,19 @@ fn agg_select_list(select: &[SelectItem], group_by: &[String]) -> Result<Vec<Sel
             }
         })
         .collect()
+}
+
+/// The Project above the Aggregate resolves columns by name, so a duplicate
+/// output name would silently pick the first column.
+fn check_unique_agg_outputs(group_by: &[String], aggs: &[(AggFunc, Expr, String)]) -> Result<()> {
+    let mut seen: Vec<&str> = group_by.iter().map(String::as_str).collect();
+    for (_, _, name) in aggs {
+        if seen.contains(&name.as_str()) {
+            anyhow::bail!("duplicate output column name '{}' in aggregate query", name);
+        }
+        seen.push(name);
+    }
+    Ok(())
 }
 
 fn contains_agg(expr: &Expr) -> bool {
