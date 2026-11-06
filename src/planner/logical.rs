@@ -177,20 +177,21 @@ pub fn build(
             group_by: stmt.group_by.clone(),
             aggs,
         };
+        plan = sort_node(plan, &stmt.order_by);
+    } else if let Some(order_by) = hidden_order_by(&stmt.select, &stmt.order_by) {
+        // 5/6. ORDER BY refers to columns the SELECT list drops: sort the
+        // Project's input, then project.
+        plan = LogicalPlan::Project {
+            input: Box::new(sort_node(plan, &order_by)),
+            exprs: stmt.select.clone(),
+        };
     } else {
-        // 5. Project (non-aggregate)
+        // 5/6. Project (non-aggregate), then Sort on its output
         plan = LogicalPlan::Project {
             input: Box::new(plan),
             exprs: stmt.select.clone(),
         };
-    }
-
-    // 6. Sort
-    if !stmt.order_by.is_empty() {
-        plan = LogicalPlan::Sort {
-            input: Box::new(plan),
-            order_by: stmt.order_by.clone(),
-        };
+        plan = sort_node(plan, &stmt.order_by);
     }
 
     if let Some(exprs) = agg_project {
@@ -260,6 +261,54 @@ fn check_grouped(expr: &Expr, group_by: &[String]) -> Result<()> {
         Expr::Unary { expr, .. } => check_grouped(expr, group_by),
         _ => Ok(()),
     }
+}
+
+fn sort_node(input: LogicalPlan, order_by: &[OrderByItem]) -> LogicalPlan {
+    if order_by.is_empty() {
+        return input;
+    }
+    LogicalPlan::Sort {
+        input: Box::new(input),
+        order_by: order_by.to_vec(),
+    }
+}
+
+/// If some ORDER BY key is not an output column of the (non-aggregate)
+/// SELECT list, return the keys rewritten to resolve against the Project's
+/// input: an alias of a plain column maps to that column, other keys are kept.
+/// Returns None when every key resolves in the output (Sort stays above).
+fn hidden_order_by(select: &[SelectItem], order_by: &[OrderByItem]) -> Option<Vec<OrderByItem>> {
+    if order_by.is_empty() || select.iter().any(|i| matches!(i, SelectItem::Wildcard)) {
+        return None;
+    }
+    let out_name = |item: &SelectItem| match item {
+        SelectItem::Expr(_, Some(alias)) => Some(alias.clone()),
+        SelectItem::Expr(Expr::Column(c), None) => Some(c.clone()),
+        _ => None,
+    };
+    let names: Vec<String> = select.iter().filter_map(out_name).collect();
+    let in_output = |col: &str| {
+        let bare = col.split('.').next_back().unwrap_or(col);
+        names.iter().any(|n| n == col || n == bare)
+    };
+    if order_by.iter().all(|o| in_output(&o.column)) {
+        return None;
+    }
+    Some(
+        order_by
+            .iter()
+            .map(|o| {
+                let source = select.iter().find_map(|i| match i {
+                    SelectItem::Expr(Expr::Column(c), Some(a)) if *a == o.column => Some(c),
+                    _ => None,
+                });
+                OrderByItem {
+                    column: source.cloned().unwrap_or_else(|| o.column.clone()),
+                    ..o.clone()
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Extract aggregate calls from the SELECT list.
@@ -498,11 +547,44 @@ mod tests {
     }
 
     #[test]
+    fn order_by_hidden_column_sorts_below_project() {
+        let p = plan("SELECT name FROM a ORDER BY id LIMIT 2").unwrap();
+        assert_eq!(shape(&p), vec!["Limit", "Project", "Sort", "Scan"]);
+    }
+
+    #[test]
+    fn order_by_output_column_or_alias_stays_above_project() {
+        let p = plan("SELECT name FROM a ORDER BY name").unwrap();
+        assert_eq!(shape(&p), vec!["Sort", "Project", "Scan"]);
+        let p = plan("SELECT name AS n FROM a ORDER BY n").unwrap();
+        assert_eq!(shape(&p), vec!["Sort", "Project", "Scan"]);
+        let p = plan("SELECT * FROM a ORDER BY id").unwrap();
+        assert_eq!(shape(&p), vec!["Sort", "Project", "Scan"]);
+    }
+
+    #[test]
+    fn order_by_alias_mixed_with_hidden_column_maps_alias_to_source() {
+        let p = plan("SELECT name AS n FROM a ORDER BY id, n").unwrap();
+        assert_eq!(shape(&p), vec!["Project", "Sort", "Scan"]);
+        match &p {
+            LogicalPlan::Project { input, .. } => match input.as_ref() {
+                LogicalPlan::Sort { order_by, .. } => {
+                    let cols: Vec<&str> = order_by.iter().map(|o| o.column.as_str()).collect();
+                    assert_eq!(cols, vec!["id", "name"]);
+                }
+                _ => panic!("expected Sort"),
+            },
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
     fn explain_simple_plan_format() {
         let p = plan("SELECT id FROM a ORDER BY id DESC, name LIMIT 3").unwrap();
+        // `name` is not selected, so Sort moves below Project (#42).
         let expected = "Limit [3]\n  \
-                        Sort [\"id DESC, name ASC\"]\n    \
-                        Project [1 exprs]\n      \
+                        Project [1 exprs]\n    \
+                        Sort [\"id DESC, name ASC\"]\n      \
                         Scan [a.csv] columns=[id:Int64, name:Utf8]";
         assert_eq!(p.explain(0), expected);
     }

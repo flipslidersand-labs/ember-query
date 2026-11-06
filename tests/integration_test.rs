@@ -203,6 +203,18 @@ fn test_order_by_desc_limit() -> Result<()> {
 }
 
 #[test]
+fn test_order_by_column_not_in_select() -> Result<()> {
+    let batches = run_query(
+        &fixture("orders.csv"),
+        "SELECT order_id FROM orders ORDER BY qty DESC LIMIT 3",
+    )?;
+    // Same ordering as test_order_by_desc_limit, but qty is not selected.
+    assert_eq!(batches[0].num_columns(), 1);
+    assert_eq!(rows_of(&batches), strs(&[&["104"], &["102"], &["106"]]));
+    Ok(())
+}
+
+#[test]
 fn test_group_by_sum_order_by_key() -> Result<()> {
     let batches = run_query(
         &fixture("orders.csv"),
