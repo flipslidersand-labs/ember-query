@@ -178,7 +178,7 @@ fn apply_binop(op: &BinOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| anyhow!("AND requires boolean rhs"))?;
-            Ok(Arc::new(compute::and(la, ra)?) as ArrayRef)
+            Ok(Arc::new(compute::and_kleene(la, ra)?) as ArrayRef)
         }
         BinOp::Or => {
             let la = l
@@ -189,7 +189,7 @@ fn apply_binop(op: &BinOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| anyhow!("OR requires boolean rhs"))?;
-            Ok(Arc::new(compute::or(la, ra)?) as ArrayRef)
+            Ok(Arc::new(compute::or_kleene(la, ra)?) as ArrayRef)
         }
     }
 }
@@ -505,7 +505,6 @@ mod eval_semantics_tests {
     // ── AND / OR ──
 
     #[test]
-    #[ignore = "不具合: arrow の compute::and は Kleene でなく、FALSE AND NULL / NULL AND FALSE が NULL になる"]
     fn and_three_valued_logic_table() {
         let e = bin(BinOp::And, col("a"), col("b"));
         let got = evaluate(&batch(), &e).unwrap();
@@ -514,7 +513,6 @@ mod eval_semantics_tests {
     }
 
     #[test]
-    #[ignore = "不具合: arrow の compute::or は Kleene でなく、TRUE OR NULL / NULL OR TRUE が NULL になる"]
     fn or_three_valued_logic_table() {
         let e = bin(BinOp::Or, col("a"), col("b"));
         let got = evaluate(&batch(), &e).unwrap();
