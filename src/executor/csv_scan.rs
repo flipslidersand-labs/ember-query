@@ -19,6 +19,7 @@ impl CsvScanExec {
     pub fn new(path: &str, table_schema: TableSchema) -> Result<Self> {
         let reader = csv::ReaderBuilder::new()
             .has_headers(true)
+            .flexible(true) // short records pad with NULL; long ones are rejected in next()
             .from_path(path)
             .map_err(|e| anyhow!("cannot open CSV '{}': {}", path, e))?;
 
@@ -58,6 +59,14 @@ impl Executor for CsvScanExec {
         let mut rows_read = 0usize;
         for result in self.reader.records().take(BATCH_SIZE) {
             let record = result?;
+            if record.len() > n_cols {
+                return Err(anyhow!(
+                    "record {} has {} fields, expected at most {}",
+                    rows_read + 1,
+                    record.len(),
+                    n_cols
+                ));
+            }
             for (col_idx, builder) in builders.iter_mut().enumerate() {
                 let val = record.get(col_idx).unwrap_or("");
                 builder.append(val)?;
@@ -398,12 +407,8 @@ mod tests {
         assert!(s.field(0).is_nullable());
     }
 
-    /// Semantics: a record shorter than the header should yield NULL for the
-    /// missing trailing cells (the code does `unwrap_or("")`). Actual: the csv
-    /// reader is not `flexible`, so it returns an UnequalLengths error before
-    /// that code is reached. Ignored until the intended behaviour is decided.
+    /// A record shorter than the header yields NULL for the missing trailing cells.
     #[test]
-    #[ignore = "short records error out (csv not flexible) instead of NULL; see Issue #13 report"]
     fn short_record_pads_with_null() {
         let f = TmpCsv::new("a,b\n1,x\n2\n");
         let batches = scan_all(
@@ -417,8 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn short_record_currently_errors() {
-        let f = TmpCsv::new("a,b\n1,x\n2\n");
+    fn long_record_still_errors() {
+        let f = TmpCsv::new("a,b\n1,x\n2,y,z\n");
         let res = scan_all(
             &f,
             schema_of(&[("a", DataType::Int64), ("b", DataType::Utf8)]),

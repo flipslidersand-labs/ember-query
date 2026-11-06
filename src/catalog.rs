@@ -20,6 +20,7 @@ pub struct TableSchema {
 pub fn infer_schema(path: &Path) -> Result<TableSchema> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
+        .flexible(true)
         .from_path(path)?;
 
     let headers: Vec<String> = reader.headers()?.iter().map(|h| h.to_string()).collect();
@@ -28,6 +29,13 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
     let mut samples: Vec<Vec<String>> = Vec::new();
     for result in reader.records().take(100) {
         let record = result?;
+        if record.len() > headers.len() {
+            anyhow::bail!(
+                "record has {} fields, expected at most {}",
+                record.len(),
+                headers.len()
+            );
+        }
         samples.push(record.iter().map(|f| f.to_string()).collect());
     }
 
