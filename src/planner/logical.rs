@@ -162,7 +162,17 @@ pub fn build(
     // 4. Determine whether there are aggregates in the SELECT list.
     let aggs: Vec<(AggFunc, Expr, String)> = collect_aggs(&stmt.select);
 
-    if !aggs.is_empty() || !stmt.group_by.is_empty() {
+    // For aggregate queries the Project (SELECT-list order, group columns the
+    // user did not select dropped) goes above Sort so ORDER BY can still use
+    // any Aggregate output column.
+    let mut agg_project = None;
+    let nested_agg = stmt
+        .select
+        .iter()
+        .any(|i| matches!(i, SelectItem::Expr(e, _) if contains_agg(e)));
+    if !aggs.is_empty() || !stmt.group_by.is_empty() || nested_agg {
+        agg_project = Some(agg_select_list(&stmt.select, &stmt.group_by)?);
+        check_unique_agg_outputs(&stmt.group_by, &aggs)?;
         plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
             group_by: stmt.group_by.clone(),
@@ -185,6 +195,13 @@ pub fn build(
         plan = sort_node(plan, &stmt.order_by);
     }
 
+    if let Some(exprs) = agg_project {
+        plan = LogicalPlan::Project {
+            input: Box::new(plan),
+            exprs,
+        };
+    }
+
     // 7. Limit
     if let Some(n) = stmt.limit {
         plan = LogicalPlan::Limit {
@@ -194,6 +211,70 @@ pub fn build(
     }
 
     Ok(plan)
+}
+
+/// Validate an aggregate query's SELECT list and rewrite it as a Project over
+/// the Aggregate output (GROUP BY columns, then aggregates named as in
+/// `collect_aggs`).
+fn agg_select_list(select: &[SelectItem], group_by: &[String]) -> Result<Vec<SelectItem>> {
+    select
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            SelectItem::Wildcard => {
+                anyhow::bail!("SELECT * is not supported in aggregate queries")
+            }
+            SelectItem::Expr(Expr::Agg { .. }, alias) => {
+                let name = alias.clone().unwrap_or_else(|| format!("agg_{}", i));
+                Ok(SelectItem::Expr(Expr::Column(name), None))
+            }
+            SelectItem::Expr(expr, _) => {
+                check_grouped(expr, group_by)?;
+                Ok(item.clone())
+            }
+        })
+        .collect()
+}
+
+/// The Project above the Aggregate resolves columns by name, so a duplicate
+/// output name would silently pick the first column.
+fn check_unique_agg_outputs(group_by: &[String], aggs: &[(AggFunc, Expr, String)]) -> Result<()> {
+    let mut seen: Vec<&str> = group_by.iter().map(String::as_str).collect();
+    for (_, _, name) in aggs {
+        if seen.contains(&name.as_str()) {
+            anyhow::bail!("duplicate output column name '{}' in aggregate query", name);
+        }
+        seen.push(name);
+    }
+    Ok(())
+}
+
+fn contains_agg(expr: &Expr) -> bool {
+    match expr {
+        Expr::Agg { .. } => true,
+        Expr::BinOp { left, right, .. } => contains_agg(left) || contains_agg(right),
+        Expr::Unary { expr, .. } => contains_agg(expr),
+        _ => false,
+    }
+}
+
+/// Non-aggregate SELECT expressions may only use GROUP BY columns.
+fn check_grouped(expr: &Expr, group_by: &[String]) -> Result<()> {
+    match expr {
+        Expr::Column(c) if !group_by.contains(c) => anyhow::bail!(
+            "column '{}' must appear in the GROUP BY clause or be used in an aggregate function",
+            c
+        ),
+        Expr::Agg { .. } => {
+            anyhow::bail!("aggregate functions inside expressions are not supported")
+        }
+        Expr::BinOp { left, right, .. } => {
+            check_grouped(left, group_by)?;
+            check_grouped(right, group_by)
+        }
+        Expr::Unary { expr, .. } => check_grouped(expr, group_by),
+        _ => Ok(()),
+    }
 }
 
 fn sort_node(input: LogicalPlan, order_by: &[OrderByItem]) -> LogicalPlan {
@@ -336,19 +417,22 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_replaces_project() {
+    fn aggregate_is_wrapped_by_select_list_project() {
         let p = plan("SELECT COUNT(*) FROM a WHERE id > 1 ORDER BY agg_0 LIMIT 1").unwrap();
         assert_eq!(
             shape(&p),
-            vec!["Limit", "Sort", "Aggregate", "Filter", "Scan"]
+            vec!["Limit", "Project", "Sort", "Aggregate", "Filter", "Scan"]
         );
     }
 
     #[test]
     fn group_by_without_aggregates_is_aggregate_with_no_aggs() {
         let p = plan("SELECT name FROM a GROUP BY name").unwrap();
-        assert_eq!(shape(&p), vec!["Aggregate", "Scan"]);
-        match p {
+        assert_eq!(shape(&p), vec!["Project", "Aggregate", "Scan"]);
+        let LogicalPlan::Project { input, .. } = p else {
+            panic!("expected Project");
+        };
+        match *input {
             LogicalPlan::Aggregate { group_by, aggs, .. } => {
                 assert_eq!(group_by, vec!["name".to_string()]);
                 assert!(aggs.is_empty());
@@ -361,7 +445,10 @@ mod tests {
     fn agg_names_use_select_position_and_alias() {
         // Position index counts every SELECT item, including non-aggregates.
         let p = plan("SELECT COUNT(*), SUM(id) AS total, MAX(id) FROM a").unwrap();
-        match p {
+        let LogicalPlan::Project { input, .. } = p else {
+            panic!("expected Project");
+        };
+        match *input {
             LogicalPlan::Aggregate { aggs, .. } => {
                 let names: Vec<&str> = aggs.iter().map(|(_, _, n)| n.as_str()).collect();
                 assert_eq!(names, vec!["agg_0", "total", "agg_2"]);
@@ -378,13 +465,52 @@ mod tests {
     #[test]
     fn auto_name_index_is_position_in_select_list() {
         let p = plan("SELECT name, COUNT(*) FROM a GROUP BY name").unwrap();
-        match p {
+        let LogicalPlan::Project { input, .. } = p else {
+            panic!("expected Project");
+        };
+        match *input {
             LogicalPlan::Aggregate { aggs, .. } => {
                 assert_eq!(aggs.len(), 1);
                 assert_eq!(aggs[0].2, "agg_1");
             }
             other => panic!("expected Aggregate, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn agg_project_follows_select_list_order() {
+        let p = plan("SELECT COUNT(*) AS n, name FROM a GROUP BY name").unwrap();
+        let LogicalPlan::Project { exprs, .. } = p else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            exprs,
+            vec![
+                SelectItem::Expr(Expr::Column("n".to_string()), None),
+                SelectItem::Expr(Expr::Column("name".to_string()), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_grouped_column_in_agg_query_is_error() {
+        for sql in [
+            "SELECT name, COUNT(*) FROM a",
+            "SELECT id, COUNT(*) FROM a GROUP BY name",
+        ] {
+            let err = plan(sql).unwrap_err().to_string();
+            assert!(err.contains("must appear in the GROUP BY"), "{sql}: {err}");
+        }
+    }
+
+    #[test]
+    fn compound_agg_expression_and_wildcard_are_errors() {
+        let err = plan("SELECT SUM(id) + 1 FROM a").unwrap_err().to_string();
+        assert!(err.contains("not supported"), "{err}");
+        let err = plan("SELECT * FROM a GROUP BY name")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not supported"), "{err}");
     }
 
     #[test]
@@ -483,17 +609,18 @@ mod tests {
             plan("SELECT name, COUNT(*) AS n FROM a JOIN b ON a.id = b.id GROUP BY name").unwrap();
         let out = p.explain(0);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "Project [2 exprs]");
         assert_eq!(
-            lines[0],
-            "Aggregate [group_by=[\"name\"], aggs=Count(Wildcard) AS n]"
+            lines[1],
+            "  Aggregate [group_by=[\"name\"], aggs=Count(Wildcard) AS n]"
         );
         assert!(
-            lines[1].starts_with("  Join [right=b.csv, on="),
+            lines[2].starts_with("    Join [right=b.csv, on="),
             "{}",
-            lines[1]
+            lines[2]
         );
-        assert_eq!(lines[2], "    Scan [a.csv] columns=[id:Int64, name:Utf8]");
+        assert_eq!(lines[3], "      Scan [a.csv] columns=[id:Int64, name:Utf8]");
     }
 
     #[test]
