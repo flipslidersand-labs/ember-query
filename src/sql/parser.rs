@@ -363,7 +363,7 @@ fn parse_mul_expr(pair: Pair<Rule>) -> Result<Expr> {
 fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
     let first = children.next().ok_or_else(|| anyhow!("empty unary_expr"))?;
-    if first.as_str() == "-" {
+    if first.as_rule() == Rule::neg_op {
         let inner = children
             .next()
             .ok_or_else(|| anyhow!("missing unary_expr operand"))?;
@@ -680,13 +680,95 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: parse_unary_expr checks first.as_str() == \"-\" but the anonymous \"-\" token yields no pair, so unary minus is silently dropped (-x parses as x)"]
     fn unary_minus_on_column() {
         let expected = Expr::Unary {
             op: UnaryOp::Neg,
             expr: col("x"),
         };
         assert_eq!(sel("-x"), expected);
+    }
+
+    #[test]
+    fn unary_minus_double_nests() {
+        let expected = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::Unary {
+                op: UnaryOp::Neg,
+                expr: col("x"),
+            }),
+        };
+        assert_eq!(sel("- -x"), expected);
+    }
+
+    #[test]
+    fn unary_minus_on_parenthesized_and_precedence() {
+        // -(a + b) は括弧全体を反転、-a * b は (-a) * b
+        assert_eq!(
+            sel("-(a + b)"),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(Expr::BinOp {
+                    op: BinOp::Add,
+                    left: col("a"),
+                    right: col("b"),
+                }),
+            }
+        );
+        assert_eq!(
+            sel("-a * b"),
+            Expr::BinOp {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: col("a"),
+                }),
+                right: col("b"),
+            }
+        );
+    }
+
+    #[test]
+    fn binary_minus_is_not_neg() {
+        let expected = Expr::BinOp {
+            op: BinOp::Sub,
+            left: col("a"),
+            right: col("b"),
+        };
+        assert_eq!(sel("a - b"), expected);
+        assert_eq!(sel("a-b"), expected);
+    }
+
+    #[test]
+    fn negative_literals_stay_literals() {
+        assert_eq!(sel("-1"), Expr::Literal(Value::Int(-1)));
+        assert_eq!(sel("-2.5"), Expr::Literal(Value::Float(-2.5)));
+        assert_eq!(
+            sel("x - -1"),
+            Expr::BinOp {
+                op: BinOp::Sub,
+                left: col("x"),
+                right: lit(Value::Int(-1)),
+            }
+        );
+    }
+
+    #[test]
+    fn unary_minus_in_where() {
+        let w = where_of("-x < 0");
+        match w {
+            Expr::BinOp {
+                op: BinOp::Lt,
+                left,
+                ..
+            } => assert_eq!(
+                *left,
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: col("x"),
+                }
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

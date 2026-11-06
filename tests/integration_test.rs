@@ -251,3 +251,48 @@ fn test_error_unknown_from_table() {
     let res = run_query(&fixture("missing.csv"), "SELECT * FROM missing");
     assert!(res.is_err(), "unknown table file must be an error");
 }
+
+// ---------------------------------------------------------------------------
+// Unary minus (#71)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unary_minus_negates_column() -> Result<()> {
+    let b = run_query(&fixture("orders.csv"), "SELECT -qty FROM orders")?;
+    assert_eq!(rows_of(&b)[..3], strs(&[&["-3"], &["-5"], &["-2"]])[..]);
+    Ok(())
+}
+
+#[test]
+fn test_unary_minus_in_where() -> Result<()> {
+    // 修正前は -qty が qty として評価され、全行が落ちる(0 件)
+    let b = run_query(
+        &fixture("orders.csv"),
+        "SELECT order_id FROM orders WHERE -qty < 0",
+    )?;
+    let all = run_query(&fixture("orders.csv"), "SELECT order_id FROM orders")?;
+    assert_eq!(rows_of(&b), rows_of(&all));
+    let none = run_query(
+        &fixture("orders.csv"),
+        "SELECT order_id FROM orders WHERE -qty > 0",
+    )?;
+    assert!(rows_of(&none).is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_unary_minus_double_and_binary() -> Result<()> {
+    let b = run_query(
+        &fixture("orders.csv"),
+        "SELECT - -qty, qty - -1, qty - 1 FROM orders",
+    )?;
+    assert_eq!(rows_of(&b)[0], ["3", "4", "2"]);
+    Ok(())
+}
+
+#[test]
+fn test_unary_minus_i64_min_overflows_via_sql() {
+    let res = run_query(&fixture("minint.csv"), "SELECT -v FROM minint");
+    let err = res.expect_err("-i64::MIN must overflow").to_string();
+    assert!(err.contains("integer overflow"), "got: {err}");
+}
