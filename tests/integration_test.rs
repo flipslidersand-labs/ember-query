@@ -239,3 +239,46 @@ fn test_error_unknown_from_table() {
     let res = run_query(&fixture("missing.csv"), "SELECT * FROM missing");
     assert!(res.is_err(), "unknown table file must be an error");
 }
+
+// ── #41: aggregate queries honour the SELECT list ────────────────────────────
+
+#[test]
+fn test_agg_select_order_follows_select_list() -> Result<()> {
+    let batches = run_query(
+        &fixture("orders.csv"),
+        "SELECT SUM(qty), region FROM orders GROUP BY region ORDER BY region",
+    )?;
+    // Aggregate emits (region, sum); the SELECT list asks for (sum, region).
+    assert_eq!(rows_of(&batches), strs(&[&["12", "east"], &["11", "west"]]));
+    Ok(())
+}
+
+#[test]
+fn test_agg_non_grouped_column_is_error() {
+    let res = run_query(
+        &fixture("orders.csv"),
+        "SELECT region, COUNT(*) FROM orders",
+    );
+    let err = res.expect_err("non-grouped column must be an error");
+    assert!(
+        err.to_string().contains("must appear in the GROUP BY"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_agg_compound_expression_is_unsupported_error() {
+    let res = run_query(&fixture("orders.csv"), "SELECT SUM(qty) + 1 FROM orders");
+    let err = res.expect_err("aggregate inside an expression must be an error");
+    assert!(err.to_string().contains("not supported"), "{err}");
+}
+
+#[test]
+fn test_agg_order_by_unselected_group_column_still_works() -> Result<()> {
+    let batches = run_query(
+        &fixture("orders.csv"),
+        "SELECT COUNT(*) FROM orders GROUP BY region ORDER BY region DESC LIMIT 1",
+    )?;
+    assert_eq!(rows_of(&batches), strs(&[&["3"]]));
+    Ok(())
+}
