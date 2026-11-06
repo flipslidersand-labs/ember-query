@@ -71,14 +71,12 @@ fn main() -> Result<()> {
 
     // 5. Execute and print results
     let mut total_rows = 0usize;
-    let mut first_batch = true;
+    let mut batches = Vec::new();
     while let Some(batch) = exec.next()? {
-        if first_batch {
-            first_batch = false;
-        }
         total_rows += batch.num_rows();
-        display::print_batch(&batch);
+        batches.push(batch);
     }
+    display::print_batch(&batches);
 
     eprintln!("({} rows)", total_rows);
     Ok(())
