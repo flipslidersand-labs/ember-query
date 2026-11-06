@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
@@ -63,17 +63,25 @@ impl SortExec {
             })
             .collect::<Result<_>>()?;
 
+        // sort_by cannot return Err, so keep the first error and surface it afterwards.
+        let mut sort_err: Option<anyhow::Error> = None;
         indices.sort_by(|&a, &b| {
             for &(col_idx, asc) in &sort_cols {
                 let arr = merged.column(col_idx);
-                let ord = compare_rows(arr, a, b);
-                let ord = if asc { ord } else { ord.reverse() };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
+                match compare_rows(arr, a, b, asc) {
+                    Ok(std::cmp::Ordering::Equal) => {}
+                    Ok(ord) => return ord,
+                    Err(e) => {
+                        sort_err.get_or_insert(e);
+                        return std::cmp::Ordering::Equal;
+                    }
                 }
             }
             std::cmp::Ordering::Equal
         });
+        if let Some(e) = sort_err {
+            return Err(e);
+        }
 
         // Reorder rows according to sorted indices
         let sorted_columns: Vec<ArrayRef> = merged
@@ -113,29 +121,31 @@ fn strip_table_prefix(col: &str) -> &str {
     col.split('.').next_back().unwrap_or(col)
 }
 
-fn compare_rows(arr: &ArrayRef, a: usize, b: usize) -> std::cmp::Ordering {
-    if arr.is_null(a) && arr.is_null(b) {
-        return std::cmp::Ordering::Equal;
+/// Compare two rows of one column. NULLS LAST regardless of `asc`:
+/// direction applies only to non-null values.
+fn compare_rows(arr: &ArrayRef, a: usize, b: usize, asc: bool) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    match (arr.is_null(a), arr.is_null(b)) {
+        (true, true) => return Ok(Ordering::Equal),
+        (true, false) => return Ok(Ordering::Greater),
+        (false, true) => return Ok(Ordering::Less),
+        _ => {}
     }
-    if arr.is_null(a) {
-        return std::cmp::Ordering::Greater;
-    }
-    if arr.is_null(b) {
-        return std::cmp::Ordering::Less;
-    }
-    if let Some(a_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-        return a_arr.value(a).cmp(&a_arr.value(b));
-    }
-    if let Some(a_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-        return a_arr
-            .value(a)
-            .partial_cmp(&a_arr.value(b))
-            .unwrap_or(std::cmp::Ordering::Equal);
-    }
-    if let Some(a_arr) = arr.as_any().downcast_ref::<StringArray>() {
-        return a_arr.value(a).cmp(a_arr.value(b));
-    }
-    std::cmp::Ordering::Equal
+    let ord = if let Some(x) = arr.as_any().downcast_ref::<Int64Array>() {
+        x.value(a).cmp(&x.value(b))
+    } else if let Some(x) = arr.as_any().downcast_ref::<Float64Array>() {
+        x.value(a).total_cmp(&x.value(b))
+    } else if let Some(x) = arr.as_any().downcast_ref::<StringArray>() {
+        x.value(a).cmp(x.value(b))
+    } else if let Some(x) = arr.as_any().downcast_ref::<BooleanArray>() {
+        x.value(a).cmp(&x.value(b))
+    } else {
+        return Err(anyhow!(
+            "ORDER BY on column type {:?} is not supported",
+            arr.data_type()
+        ));
+    };
+    Ok(if asc { ord } else { ord.reverse() })
 }
 
 fn take_rows(arr: &ArrayRef, indices: &[usize]) -> Result<ArrayRef> {
@@ -242,6 +252,100 @@ mod tests {
         );
         let out = sorted(vec![b], vec![("price", true), ("name", true)]).unwrap();
         assert_eq!(ids(&out), vec![Some(3), Some(2), Some(1)]);
+    }
+
+    fn flag_out(schema: SchemaRef, batch: RecordBatch, asc: bool) -> Result<Vec<Option<i64>>> {
+        let input = Box::new(VecExec {
+            schema,
+            batches: vec![batch],
+        });
+        let order_by = vec![OrderByItem {
+            column: "flag".to_string(),
+            asc,
+        }];
+        let mut exec = SortExec::new(input, order_by)?;
+        let out = exec.next()?.unwrap();
+        let a = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        Ok((0..a.len()).map(|i| Some(a.value(i))).collect())
+    }
+
+    fn flag_batch() -> (SchemaRef, RecordBatch) {
+        use arrow::array::BooleanArray;
+        let s = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+        let b = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    None,
+                    Some(false),
+                    Some(true),
+                ])),
+            ],
+        )
+        .unwrap();
+        (s, b)
+    }
+
+    #[test]
+    fn sorts_boolean_ascending_false_before_true_nulls_last() {
+        let (s, b) = flag_batch();
+        assert_eq!(
+            flag_out(s, b, true).unwrap(),
+            vec![Some(3), Some(1), Some(4), Some(2)]
+        );
+    }
+
+    #[test]
+    fn sorts_boolean_descending_nulls_last() {
+        let (s, b) = flag_batch();
+        assert_eq!(
+            flag_out(s, b, false).unwrap(),
+            vec![Some(1), Some(4), Some(3), Some(2)]
+        );
+    }
+
+    #[test]
+    fn unsupported_column_type_errors() {
+        let s = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("flag", DataType::Int32, true),
+        ]));
+        let b = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(arrow::array::Int32Array::from(vec![2, 1])),
+            ],
+        )
+        .unwrap();
+        assert!(flag_out(s, b, true).is_err());
+    }
+
+    #[test]
+    fn descending_keeps_nulls_last() {
+        let b = batch(
+            vec![Some(2), None, Some(3), Some(1)],
+            vec![0.0; 4],
+            vec!["a"; 4],
+        );
+        let out = sorted(vec![b], vec![("id", false)]).unwrap();
+        assert_eq!(ids(&out), vec![Some(3), Some(2), Some(1), None]);
+    }
+
+    #[test]
+    fn float_nan_has_total_order() {
+        let b = batch(
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            vec![f64::NAN, 2.0, 1.0, 3.0],
+            vec!["a"; 4],
+        );
+        let out = sorted(vec![b], vec![("price", true)]).unwrap();
+        assert_eq!(ids(&out), vec![Some(3), Some(2), Some(4), Some(1)]);
     }
 
     #[test]
