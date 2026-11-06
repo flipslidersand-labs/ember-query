@@ -10,41 +10,67 @@ use std::sync::Arc;
 use super::{evaluate, Executor};
 use crate::sql::ast::{AggFunc, Expr};
 
+/// A typed MIN/MAX candidate (keeps the input type, no f64 round trip).
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+enum Val {
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
 /// Per-group accumulator state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AggState {
     count: i64,
-    sum: f64,
-    min: f64,
-    max: f64,
-    first: bool, // true = min/max not yet set
+    sum_i: i64,
+    sum_f: f64,
+    min: Option<Val>,
+    max: Option<Val>,
 }
 
 impl AggState {
     fn new() -> Self {
         AggState {
             count: 0,
-            sum: 0.0,
-            min: f64::INFINITY,
-            max: f64::NEG_INFINITY,
-            first: true,
+            sum_i: 0,
+            sum_f: 0.0,
+            min: None,
+            max: None,
         }
-    }
-
-    fn update(&mut self, val: f64) {
-        self.count += 1;
-        self.sum += val;
-        if self.first || val < self.min {
-            self.min = val;
-        }
-        if self.first || val > self.max {
-            self.max = val;
-        }
-        self.first = false;
     }
 
     fn update_count_only(&mut self) {
         self.count += 1;
+    }
+
+    fn update_minmax(&mut self, v: Val) {
+        if self.min.as_ref().is_none_or(|m| v < *m) {
+            self.min = Some(v.clone());
+        }
+        if self.max.as_ref().is_none_or(|m| v > *m) {
+            self.max = Some(v);
+        }
+    }
+}
+
+/// Argument type of an aggregate, inferred by evaluating over an empty batch.
+fn check_agg_type(func: &AggFunc, dt: &DataType, name: &str) -> Result<()> {
+    let ok = match func {
+        AggFunc::Count => true,
+        AggFunc::Sum | AggFunc::Avg => matches!(dt, DataType::Int64 | DataType::Float64),
+        AggFunc::Min | AggFunc::Max => {
+            matches!(dt, DataType::Int64 | DataType::Float64 | DataType::Utf8)
+        }
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "type error: {:?} is not supported for {:?} (column '{}')",
+            dt,
+            func,
+            name
+        ))
     }
 }
 
@@ -74,10 +100,17 @@ impl HashAggExec {
                 .map_err(|_| anyhow!("GROUP BY column '{}' not found", col))?;
             fields.push(f.clone());
         }
-        for (func, _, name) in &aggs {
-            let dt = match func {
-                AggFunc::Count => DataType::Int64,
-                AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => DataType::Float64,
+        let empty = RecordBatch::new_empty(in_schema.clone());
+        for (func, expr, name) in &aggs {
+            let dt = if matches!(func, AggFunc::Count) {
+                DataType::Int64
+            } else {
+                let arg_dt = evaluate(&empty, expr)?.data_type().clone();
+                check_agg_type(func, &arg_dt, name)?;
+                match func {
+                    AggFunc::Avg => DataType::Float64,
+                    _ => arg_dt,
+                }
             };
             fields.push(Field::new(name, dt, true));
         }
@@ -142,8 +175,8 @@ impl HashAggExec {
                             }
                         }
                         _ => {
-                            if let Some(v) = f64_at(arr, row) {
-                                states[agg_idx].update(v);
+                            if !arr.is_null(row) {
+                                update_value(&mut states[agg_idx], func, arr, row)?;
                             }
                         }
                     }
@@ -171,10 +204,15 @@ impl HashAggExec {
         // Aggregate result columns
         let gb_len = self.group_by.len();
         for (agg_idx, (func, _, _)) in self.aggs.iter().enumerate() {
-            let arr = build_agg_column(func, &key_order, &map, agg_idx, n_rows)?;
+            let arr = build_agg_column(
+                func,
+                self.out_schema.field(gb_len + agg_idx).data_type(),
+                &key_order,
+                &map,
+                agg_idx,
+            )?;
             columns.push(arr);
         }
-        let _ = gb_len;
 
         RecordBatch::try_new(self.out_schema.clone(), columns).map_err(anyhow::Error::from)
     }
@@ -239,20 +277,42 @@ fn scalar_at(arr: &ArrayRef, row: usize) -> ScalarKey {
     ScalarKey::Null
 }
 
-fn f64_at(arr: &ArrayRef, row: usize) -> Option<f64> {
-    if arr.is_null(row) {
-        return None;
+/// Fold one non-NULL value into the state. Int64 sums use checked_add.
+fn update_value(st: &mut AggState, func: &AggFunc, arr: &ArrayRef, row: usize) -> Result<()> {
+    let any = arr.as_any();
+    let val = if let Some(a) = any.downcast_ref::<Int64Array>() {
+        Val::Int(a.value(row))
+    } else if let Some(a) = any.downcast_ref::<Float64Array>() {
+        Val::Float(a.value(row))
+    } else if let Some(a) = any.downcast_ref::<StringArray>() {
+        Val::Str(a.value(row).to_string())
+    } else {
+        return Err(anyhow!(
+            "type error: {:?} is not supported for {:?}",
+            arr.data_type(),
+            func
+        ));
+    };
+    st.count += 1;
+    match (func, val) {
+        (AggFunc::Sum, Val::Int(i)) => {
+            st.sum_i = st
+                .sum_i
+                .checked_add(i)
+                .ok_or_else(|| anyhow!("integer overflow in SUM"))?;
+        }
+        (AggFunc::Sum | AggFunc::Avg, Val::Float(f)) => st.sum_f += f,
+        (AggFunc::Avg, Val::Int(i)) => st.sum_f += i as f64,
+        (AggFunc::Min | AggFunc::Max, v) => st.update_minmax(v),
+        _ => {
+            return Err(anyhow!(
+                "type error: {:?} is not supported for {:?}",
+                arr.data_type(),
+                func
+            ))
+        }
     }
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row) as f64);
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::BooleanArray>() {
-        return Some(if a.value(row) { 1.0 } else { 0.0 });
-    }
-    None
+    Ok(())
 }
 
 // ── Column builders ───────────────────────────────────────────────────────────
@@ -320,64 +380,59 @@ fn build_group_column(
 
 fn build_agg_column(
     func: &AggFunc,
+    dt: &DataType,
     key_order: &[Vec<ScalarKey>],
     map: &HashMap<Vec<ScalarKey>, Vec<AggState>>,
     agg_idx: usize,
-    _n: usize,
 ) -> Result<ArrayRef> {
-    match func {
-        AggFunc::Count => {
+    let states = key_order.iter().map(|k| &map[k][agg_idx]);
+    // NULL when the group saw no non-NULL value.
+    let pick = |s: &AggState| -> Option<Val> {
+        if s.count == 0 {
+            return None;
+        }
+        match func {
+            AggFunc::Sum if dt == &DataType::Int64 => Some(Val::Int(s.sum_i)),
+            AggFunc::Sum => Some(Val::Float(s.sum_f)),
+            AggFunc::Avg => Some(Val::Float(s.sum_f / s.count as f64)),
+            AggFunc::Min => s.min.clone(),
+            _ => s.max.clone(),
+        }
+    };
+    match (func, dt) {
+        (AggFunc::Count, _) => {
             let mut b = Int64Builder::new();
-            for key in key_order {
-                let state = &map[key][agg_idx];
-                b.append_value(state.count);
+            for s in states {
+                b.append_value(s.count);
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
-        AggFunc::Sum => {
-            let mut b = Float64Builder::new();
-            for key in key_order {
-                let state = &map[key][agg_idx];
-                if state.count > 0 {
-                    b.append_value(state.sum);
-                } else {
-                    b.append_null();
+        (_, DataType::Int64) => {
+            let mut b = Int64Builder::new();
+            for s in states {
+                match pick(s) {
+                    Some(Val::Int(i)) => b.append_value(i),
+                    _ => b.append_null(),
                 }
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
-        AggFunc::Avg => {
+        (_, DataType::Float64) => {
             let mut b = Float64Builder::new();
-            for key in key_order {
-                let state = &map[key][agg_idx];
-                if state.count > 0 {
-                    b.append_value(state.sum / state.count as f64);
-                } else {
-                    b.append_null();
+            for s in states {
+                match pick(s) {
+                    Some(Val::Float(f)) => b.append_value(f),
+                    _ => b.append_null(),
                 }
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
-        AggFunc::Min => {
-            let mut b = Float64Builder::new();
-            for key in key_order {
-                let state = &map[key][agg_idx];
-                if state.count > 0 {
-                    b.append_value(state.min);
-                } else {
-                    b.append_null();
-                }
-            }
-            Ok(Arc::new(b.finish()) as ArrayRef)
-        }
-        AggFunc::Max => {
-            let mut b = Float64Builder::new();
-            for key in key_order {
-                let state = &map[key][agg_idx];
-                if state.count > 0 {
-                    b.append_value(state.max);
-                } else {
-                    b.append_null();
+        _ => {
+            let mut b = StringBuilder::new();
+            for s in states {
+                match pick(s) {
+                    Some(Val::Str(v)) => b.append_value(v),
+                    _ => b.append_null(),
                 }
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
@@ -453,12 +508,8 @@ mod tests {
             vec![Some(1), None, Some(3)],
             vec![(AggFunc::Sum, col("v"), "t".into())],
         );
-        let t = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        assert_eq!(t.value(0), 4.0);
+        let t = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(t.value(0), 4);
     }
 
     // ── #12: grouped / value / edge-case tests ──
@@ -533,7 +584,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.num_rows(), 2);
         assert_eq!((keys.value(0), keys.value(1)), ("a", "b"));
-        assert_eq!((f64s(&out, 1).value(0), f64s(&out, 1).value(1)), (4.0, 2.0));
+        assert_eq!((i64s(&out, 1).value(0), i64s(&out, 1).value(1)), (4, 2));
         assert_eq!((i64s(&out, 2).value(0), i64s(&out, 2).value(1)), (2, 1));
     }
 
@@ -549,8 +600,8 @@ mod tests {
         assert_eq!(out.num_rows(), 2);
         assert_eq!(i64s(&out, 0).value(0), 10);
         assert_eq!(i64s(&out, 0).value(1), 20);
-        assert_eq!(f64s(&out, 1).value(0), 9.0);
-        assert_eq!(f64s(&out, 1).value(1), 6.0);
+        assert_eq!(i64s(&out, 1).value(0), 9);
+        assert_eq!(i64s(&out, 1).value(1), 6);
     }
 
     #[test]
@@ -569,8 +620,8 @@ mod tests {
         assert_eq!(out.num_rows(), 2);
         assert!(keys.value(0));
         assert!(!keys.value(1));
-        assert_eq!(f64s(&out, 1).value(0), 4.0);
-        assert_eq!(f64s(&out, 1).value(1), 2.0);
+        assert_eq!(i64s(&out, 1).value(0), 4);
+        assert_eq!(i64s(&out, 1).value(1), 2);
     }
 
     #[test]
@@ -597,8 +648,8 @@ mod tests {
         assert_eq!((keys.value(0), keys.value(1)), (1.5, 2.25));
         assert!(arrow::array::Array::is_null(keys, 2));
         assert_eq!(keys.value(3), 0.0);
-        assert_eq!(f64s(&out, 1).value(0), 4.0);
-        assert_eq!(f64s(&out, 1).value(3), 11.0);
+        assert_eq!(i64s(&out, 1).value(0), 4);
+        assert_eq!(i64s(&out, 1).value(3), 11);
     }
 
     #[test]
@@ -615,42 +666,42 @@ mod tests {
         assert_eq!(out.num_rows(), 2);
         assert_eq!(i64s(&out, 0).value(0), 1);
         assert!(out.column(0).is_null(1));
-        assert_eq!(f64s(&out, 1).value(0), 5.0);
-        assert_eq!(f64s(&out, 1).value(1), 5.0);
+        assert_eq!(i64s(&out, 1).value(0), 5);
+        assert_eq!(i64s(&out, 1).value(1), 5);
     }
 
     #[test]
     fn sum_avg_min_max_with_negative_values() {
         let out = run_agg(vec![Some(-5), Some(-1), Some(-3)], all_aggs());
-        assert_eq!(f64s(&out, 0).value(0), -9.0);
+        assert_eq!(i64s(&out, 0).value(0), -9);
         assert_eq!(f64s(&out, 1).value(0), -3.0);
         // max must be -1, not an initial 0.
-        assert_eq!(f64s(&out, 2).value(0), -5.0);
-        assert_eq!(f64s(&out, 3).value(0), -1.0);
+        assert_eq!(i64s(&out, 2).value(0), -5);
+        assert_eq!(i64s(&out, 3).value(0), -1);
     }
 
     #[test]
     fn min_max_with_all_positive_values() {
         // min must be 5, not an initial 0.
         let out = run_agg(vec![Some(5), Some(9), Some(7)], all_aggs());
-        assert_eq!(f64s(&out, 2).value(0), 5.0);
-        assert_eq!(f64s(&out, 3).value(0), 9.0);
+        assert_eq!(i64s(&out, 2).value(0), 5);
+        assert_eq!(i64s(&out, 3).value(0), 9);
     }
 
     #[test]
     fn all_equal_values() {
         let out = run_agg(vec![Some(7), Some(7), Some(7)], all_aggs());
-        assert_eq!(f64s(&out, 0).value(0), 21.0);
+        assert_eq!(i64s(&out, 0).value(0), 21);
         assert_eq!(f64s(&out, 1).value(0), 7.0);
-        assert_eq!(f64s(&out, 2).value(0), 7.0);
-        assert_eq!(f64s(&out, 3).value(0), 7.0);
+        assert_eq!(i64s(&out, 2).value(0), 7);
+        assert_eq!(i64s(&out, 3).value(0), 7);
     }
 
     #[test]
     fn single_row_min_max() {
         let out = run_agg(vec![Some(-2)], all_aggs());
-        assert_eq!(f64s(&out, 2).value(0), -2.0);
-        assert_eq!(f64s(&out, 3).value(0), -2.0);
+        assert_eq!(i64s(&out, 2).value(0), -2);
+        assert_eq!(i64s(&out, 3).value(0), -2);
     }
 
     #[test]
@@ -658,8 +709,8 @@ mod tests {
         // AVG = (1 + 3) / 2, not / 3.
         let out = run_agg(vec![Some(1), None, Some(3)], all_aggs());
         assert_eq!(f64s(&out, 1).value(0), 2.0);
-        assert_eq!(f64s(&out, 2).value(0), 1.0);
-        assert_eq!(f64s(&out, 3).value(0), 3.0);
+        assert_eq!(i64s(&out, 2).value(0), 1);
+        assert_eq!(i64s(&out, 3).value(0), 3);
     }
 
     #[test]
@@ -722,12 +773,113 @@ mod tests {
             types,
             vec![
                 DataType::Utf8,
+                DataType::Int64,
                 DataType::Float64,
-                DataType::Float64,
-                DataType::Float64,
-                DataType::Float64,
+                DataType::Int64,
+                DataType::Int64,
                 DataType::Int64
             ]
         );
+    }
+
+    // ── #43: typed SUM/MIN/MAX/AVG ──
+
+    const BIG: i64 = (1i64 << 53) + 1;
+
+    fn try_agg(
+        cols: Vec<(&str, ArrayRef)>,
+        aggs: Vec<(AggFunc, Expr, String)>,
+    ) -> Result<RecordBatch> {
+        HashAggExec::new(make_exec(cols, false), vec![], aggs)?
+            .next()
+            .map(|b| b.unwrap())
+    }
+
+    #[test]
+    fn int64_sum_min_max_are_exact_above_2_pow_53() {
+        let out = run_agg(vec![Some(BIG), Some(BIG + 2)], {
+            vec![
+                (AggFunc::Sum, col("v"), "s".into()),
+                (AggFunc::Min, col("v"), "mn".into()),
+                (AggFunc::Max, col("v"), "mx".into()),
+            ]
+        });
+        assert_eq!(i64s(&out, 0).value(0), 2 * BIG + 2);
+        assert_eq!(i64s(&out, 1).value(0), BIG);
+        assert_eq!(i64s(&out, 2).value(0), BIG + 2);
+    }
+
+    #[test]
+    fn utf8_min_max_return_strings() {
+        let v: ArrayRef = Arc::new(StringArray::from(vec![Some("pear"), None, Some("apple")]));
+        let out = try_agg(
+            vec![("v", v)],
+            vec![
+                (AggFunc::Min, col("v"), "mn".into()),
+                (AggFunc::Max, col("v"), "mx".into()),
+            ],
+        )
+        .unwrap();
+        let mn = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mx = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!((mn.value(0), mx.value(0)), ("apple", "pear"));
+    }
+
+    #[test]
+    fn sum_and_avg_of_utf8_are_type_errors() {
+        for f in [AggFunc::Sum, AggFunc::Avg] {
+            let v: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+            let res = try_agg(vec![("v", v)], vec![(f, col("v"), "x".into())]);
+            assert!(res.is_err(), "Utf8 must be a type error");
+        }
+    }
+
+    #[test]
+    fn sum_of_bool_is_a_type_error() {
+        let v: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let res = try_agg(vec![("v", v)], vec![(AggFunc::Sum, col("v"), "x".into())]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn int64_sum_overflow_is_an_error() {
+        let res = try_agg(
+            vec![("v", ints(vec![Some(i64::MAX), Some(1)]))],
+            vec![(AggFunc::Sum, col("v"), "x".into())],
+        );
+        let err = res.expect_err("expected overflow error");
+        assert!(err.to_string().contains("integer overflow"), "{err}");
+    }
+
+    #[test]
+    fn float64_aggregates_keep_float64_and_skip_nulls() {
+        let v: ArrayRef = Arc::new(F64::from(vec![Some(1.5), None, Some(2.5)]));
+        let out = try_agg(
+            vec![("v", v)],
+            vec![
+                (AggFunc::Sum, col("v"), "s".into()),
+                (AggFunc::Avg, col("v"), "a".into()),
+                (AggFunc::Min, col("v"), "mn".into()),
+                (AggFunc::Max, col("v"), "mx".into()),
+            ],
+        )
+        .unwrap();
+        let got: Vec<f64> = (0..4).map(|i| f64s(&out, i).value(0)).collect();
+        assert_eq!(got, vec![4.0, 2.0, 1.5, 2.5]);
+    }
+
+    #[test]
+    fn utf8_min_max_are_null_when_all_null() {
+        let v: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>, None]));
+        let out = try_agg(vec![("v", v)], vec![(AggFunc::Max, col("v"), "x".into())]).unwrap();
+        assert!(out.column(0).is_null(0));
     }
 }
