@@ -68,7 +68,17 @@ pub fn evaluate(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
                 UnaryOp::Neg => {
                     // Negate numeric column
                     if let Some(i64_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-                        let negated: Int64Array = i64_arr.iter().map(|v| v.map(|x| -x)).collect();
+                        let negated: Int64Array = i64_arr
+                            .iter()
+                            .map(|v| {
+                                v.map(|x| {
+                                    x.checked_neg().ok_or_else(|| {
+                                        anyhow!("integer overflow: cannot negate {x}")
+                                    })
+                                })
+                                .transpose()
+                            })
+                            .collect::<Result<_>>()?;
                         Ok(Arc::new(negated) as ArrayRef)
                     } else if let Some(f64_arr) = arr.as_any().downcast_ref::<Float64Array>() {
                         let negated: Float64Array = f64_arr.iter().map(|v| v.map(|x| -x)).collect();
@@ -293,5 +303,51 @@ mod binop_mixed_type_tests {
         let got = evaluate(&batch(), &e).unwrap();
         let got = got.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(got, &Float64Array::from(vec![6.5, 12.0, 23.25]));
+    }
+}
+
+#[cfg(test)]
+mod neg_tests {
+    use super::*;
+    use arrow::datatypes::{Field, Schema};
+
+    fn neg(e: Expr) -> Expr {
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(e),
+        }
+    }
+
+    fn batch_of(col: ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            col.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[test]
+    fn neg_i64_min_is_overflow_error() {
+        let b = batch_of(Arc::new(Int64Array::from(vec![1, i64::MIN])) as ArrayRef);
+        let err = evaluate(&b, &neg(Expr::Column("v".into()))).unwrap_err();
+        assert!(err.to_string().contains("integer overflow"), "{err}");
+    }
+
+    #[test]
+    fn neg_i64_with_null_and_normal_values() {
+        let b = batch_of(Arc::new(Int64Array::from(vec![Some(5), None, Some(-3)])) as ArrayRef);
+        let got = evaluate(&b, &neg(Expr::Column("v".into()))).unwrap();
+        let got = got.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(got, &Int64Array::from(vec![Some(-5), None, Some(3)]));
+    }
+
+    #[test]
+    fn neg_f64_unchanged() {
+        let b =
+            batch_of(Arc::new(Float64Array::from(vec![Some(1.5), None, Some(-2.0)])) as ArrayRef);
+        let got = evaluate(&b, &neg(Expr::Column("v".into()))).unwrap();
+        let got = got.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(got, &Float64Array::from(vec![Some(-1.5), None, Some(2.0)]));
     }
 }
