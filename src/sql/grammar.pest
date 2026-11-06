@@ -80,7 +80,8 @@ group_by_clause = { KW_GROUP ~ KW_BY ~ ident ~ ("," ~ ident)* }
 
 // ORDER BY clause
 order_by_clause = { KW_ORDER ~ KW_BY ~ order_item ~ ("," ~ order_item)* }
-order_item = { column_ref ~ (KW_ASC | KW_DESC)? }
+order_item = { column_ref ~ sort_dir? }
+sort_dir = { KW_ASC | KW_DESC }
 
 // LIMIT clause
 limit_clause = { KW_LIMIT ~ integer }

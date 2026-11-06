@@ -107,13 +107,14 @@ fn parse_join_clause(pair: Pair<Rule>) -> Result<super::ast::JoinClause> {
 }
 
 fn parse_order_item(pair: Pair<Rule>) -> super::ast::OrderByItem {
-    let text = pair.as_str().to_uppercase();
-    let asc = !text.ends_with("DESC");
-    let column = pair
-        .into_inner()
+    let mut inner = pair.into_inner();
+    let column = inner
         .next()
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
+    let asc = inner
+        .find(|p| p.as_rule() == Rule::sort_dir)
+        .is_none_or(|p| !p.as_str().eq_ignore_ascii_case("DESC"));
     super::ast::OrderByItem { column, asc }
 }
 
@@ -473,5 +474,19 @@ mod tests {
         );
         assert!(s.order_by[0].asc);
         assert_eq!(s.limit, Some(3));
+    }
+
+    #[test]
+    fn order_by_column_ending_in_desc_is_ascending() {
+        let s = parse("SELECT * FROM t ORDER BY is_desc").unwrap();
+        assert!(s.order_by[0].asc);
+        assert_eq!(s.order_by[0].column, "is_desc");
+    }
+
+    #[test]
+    fn order_by_explicit_desc_is_descending() {
+        let s = parse("SELECT * FROM t ORDER BY x DESC").unwrap();
+        assert!(!s.order_by[0].asc);
+        assert_eq!(s.order_by[0].column, "x");
     }
 }
