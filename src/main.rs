@@ -4,7 +4,7 @@ mod executor;
 mod planner;
 mod sql;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::Path;
 
@@ -37,11 +37,25 @@ fn main() -> Result<()> {
     // 3. Build catalog: infer schema for each JOIN table from sibling CSVs
     let mut cat: std::collections::HashMap<String, (String, catalog::TableSchema)> =
         std::collections::HashMap::new();
+    let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
     for join in &stmt.joins {
-        let join_path = format!("{}.csv", join.table);
-        if let Ok(s) = catalog::infer_schema(Path::new(&join_path)) {
-            cat.insert(join.table.clone(), (join_path, s));
+        let join_path = base_dir.join(format!("{}.csv", join.table));
+        // A missing file is left to the planner's "not found in catalog" error;
+        // any other failure (bad CSV, permissions) is reported with its cause.
+        if !join_path.exists() {
+            continue;
         }
+        let s = catalog::infer_schema(&join_path).with_context(|| {
+            format!(
+                "failed to read JOIN table '{}' from {}",
+                join.table,
+                join_path.display()
+            )
+        })?;
+        cat.insert(
+            join.table.clone(),
+            (join_path.to_string_lossy().into_owned(), s),
+        );
     }
 
     // 4. Build logical plan
