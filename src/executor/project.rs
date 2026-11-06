@@ -1,5 +1,5 @@
 use anyhow::Result;
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -86,19 +86,12 @@ fn expr_name(expr: &Expr, _schema: &Schema) -> String {
     }
 }
 
-fn infer_expr_type(expr: &Expr, schema: &Schema) -> arrow::datatypes::DataType {
-    use arrow::datatypes::DataType;
-    match expr {
-        Expr::Column(name) => schema
-            .field_with_name(name)
-            .map(|f| f.data_type().clone())
-            .unwrap_or(DataType::Utf8),
-        Expr::Literal(val) => match val {
-            crate::sql::ast::Value::Int(_) => DataType::Int64,
-            crate::sql::ast::Value::Float(_) => DataType::Float64,
-            crate::sql::ast::Value::Bool(_) => DataType::Boolean,
-            _ => DataType::Utf8,
-        },
-        _ => DataType::Utf8,
-    }
+/// Infer the output type by evaluating `expr` over an empty batch, so the
+/// declared schema always matches what `evaluate` produces. Expressions that
+/// cannot be evaluated here (e.g. aggregates) keep the legacy Utf8 fallback.
+fn infer_expr_type(expr: &Expr, schema: &SchemaRef) -> DataType {
+    let empty = RecordBatch::new_empty(schema.clone());
+    evaluate(&empty, expr)
+        .map(|a| a.data_type().clone())
+        .unwrap_or(DataType::Utf8)
 }

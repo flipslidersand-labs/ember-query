@@ -64,3 +64,51 @@ fn test_count_star() -> Result<()> {
     assert_eq!(count_arr.value(0), 5, "COUNT(*) should be 5");
     Ok(())
 }
+
+fn types_of(sql: &str) -> Result<Vec<arrow::datatypes::DataType>> {
+    let batches = run_query(&sample_csv(), sql)?;
+    Ok(batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.data_type().clone())
+        .collect())
+}
+
+#[test]
+fn test_project_arithmetic_expr_is_int64() -> Result<()> {
+    use arrow::array::Int64Array;
+    let batches = run_query(&sample_csv(), "SELECT price * 2 FROM data")?;
+    let col = batches[0].column(0);
+    let arr = col.as_any().downcast_ref::<Int64Array>().expect("Int64");
+    assert_eq!(arr.value(0), 3000);
+    Ok(())
+}
+
+#[test]
+fn test_project_comparison_expr_is_boolean() -> Result<()> {
+    use arrow::datatypes::DataType;
+    assert_eq!(types_of("SELECT price > 1 FROM data")?, [DataType::Boolean]);
+    Ok(())
+}
+
+#[test]
+fn test_project_null_literal_is_int64() -> Result<()> {
+    use arrow::datatypes::DataType;
+    assert_eq!(types_of("SELECT NULL FROM data")?, [DataType::Int64]);
+    Ok(())
+}
+
+#[test]
+fn test_project_neg_keeps_input_type() -> Result<()> {
+    use arrow::datatypes::DataType;
+    assert_eq!(types_of("SELECT -price FROM data")?, [DataType::Int64]);
+    Ok(())
+}
+
+#[test]
+fn test_project_duplicate_columns() -> Result<()> {
+    let batches = run_query(&sample_csv(), "SELECT price, price FROM data")?;
+    assert_eq!(batches[0].num_columns(), 2);
+    Ok(())
+}
