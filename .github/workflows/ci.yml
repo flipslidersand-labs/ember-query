@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    uses: flipslidersand-labs/qa-workflows/.github/workflows/rust-test.yml@main
+    uses: flipslidersand-labs/qa-workflows/.github/workflows/rust-test.yml@b79c88ce85af852181f14442c0875a0680faab73 # main
