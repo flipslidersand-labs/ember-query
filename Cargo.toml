@@ -13,7 +13,7 @@ name = "ember_query"
 path = "src/lib.rs"
 
 [dependencies]
-arrow       = "53"
+arrow       = "60"
 csv         = "1"
 pest        = "2"
 pest_derive = "2"
