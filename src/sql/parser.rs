@@ -30,9 +30,8 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
     let select_list = inner.next().ok_or_else(|| anyhow!("missing select_list"))?;
     let select = parse_select_list(select_list)?;
 
-    // table_ref (table_name + optional alias)
-    let table_ref = inner.next().ok_or_else(|| anyhow!("missing table_ref"))?;
-    let (from, from_alias) = parse_table_ref(table_ref);
+    // table_ref: the primary table path is resolved by the caller, so only consume it here.
+    inner.next().ok_or_else(|| anyhow!("missing table_ref"))?;
 
     let mut joins = Vec::new();
     let mut where_ = None;
@@ -80,8 +79,6 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
 
     Ok(SelectStmt {
         select,
-        from,
-        from_alias,
         joins,
         where_,
         group_by,
@@ -90,25 +87,23 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
     })
 }
 
-fn parse_table_ref(pair: Pair<Rule>) -> (String, Option<String>) {
-    let mut inner = pair.into_inner();
-    let name = inner
+/// Table name of a `table_ref` (the optional alias is accepted by the grammar but not used).
+fn parse_table_ref(pair: Pair<Rule>) -> String {
+    pair.into_inner()
         .next()
         .map(|p| p.as_str().to_string())
-        .unwrap_or_default();
-    let alias = inner.next().map(|p| p.as_str().to_string());
-    (name, alias)
+        .unwrap_or_default()
 }
 
 fn parse_join_clause(pair: Pair<Rule>) -> Result<super::ast::JoinClause> {
     let mut inner = pair.into_inner();
     let table_ref = inner.next().ok_or_else(|| anyhow!("JOIN missing table"))?;
-    let (table, alias) = parse_table_ref(table_ref);
+    let table = parse_table_ref(table_ref);
     let on_pair = inner
         .next()
         .ok_or_else(|| anyhow!("JOIN missing ON expr"))?;
     let on = parse_expr(on_pair)?;
-    Ok(super::ast::JoinClause { table, alias, on })
+    Ok(super::ast::JoinClause { table, on })
 }
 
 fn parse_order_item(pair: Pair<Rule>) -> super::ast::OrderByItem {
