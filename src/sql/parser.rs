@@ -9,8 +9,72 @@ use anyhow::{anyhow, Result};
 #[grammar = "sql/grammar.pest"]
 pub struct SqlParser;
 
+/// Maximum accepted SQL length in bytes.
+const MAX_SQL_LEN: usize = 64 * 1024;
+/// Maximum nesting depth of parentheses plus prefix operators (`NOT`, `-`).
+const MAX_NEST_DEPTH: usize = 128;
+
+/// Rejects oversized or deeply nested input before the recursive parser runs,
+/// so hostile SQL returns an error instead of overflowing the stack.
+fn check_limits(sql: &str) -> Result<()> {
+    if sql.len() > MAX_SQL_LEN {
+        return Err(anyhow!("SQL is too long (max {MAX_SQL_LEN} bytes)"));
+    }
+    let b = sql.as_bytes();
+    let (mut i, mut base, mut run) = (0, 0usize, 0usize);
+    let mut stack: Vec<usize> = Vec::new();
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                run = 0;
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'-' => run += 1,
+            b'(' => {
+                let added = run + 1;
+                base += added;
+                stack.push(added);
+                run = 0;
+            }
+            b')' => {
+                base -= stack.pop().unwrap_or(0);
+                run = 0;
+            }
+            c if c.is_ascii_alphanumeric() || c == b'_' => {
+                let start = i;
+                while i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_') {
+                    i += 1;
+                }
+                if b[start..=i].eq_ignore_ascii_case(b"NOT") {
+                    run += 1;
+                } else {
+                    run = 0;
+                }
+            }
+            c if c.is_ascii_whitespace() => {}
+            _ => run = 0,
+        }
+        if base + run > MAX_NEST_DEPTH {
+            return Err(anyhow!(
+                "SQL is too deeply nested (max depth {MAX_NEST_DEPTH})"
+            ));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Entry point — parses a SQL string into a `SelectStmt`.
 pub fn parse(sql: &str) -> Result<SelectStmt> {
+    check_limits(sql)?;
     let mut pairs =
         SqlParser::parse(Rule::query, sql).map_err(|e| anyhow!("Parse error: {}", e))?;
 
@@ -403,6 +467,64 @@ mod tests {
             left: col(c),
             right: Box::new(Expr::Literal(Value::Int(n))),
         }
+    }
+
+    fn nested_ok(sql: &str) {
+        parse(sql).unwrap();
+    }
+
+    #[test]
+    fn moderate_nesting_still_parses() {
+        let n = 100;
+        nested_ok(&format!(
+            "SELECT * FROM t WHERE {}a = 1{}",
+            "(".repeat(n),
+            ")".repeat(n)
+        ));
+        nested_ok(&format!("SELECT * FROM t WHERE {}a = 1", "NOT ".repeat(n)));
+        nested_ok(&format!("SELECT * FROM t WHERE a = {}1", "- ".repeat(n)));
+        nested_ok("SELECT * FROM t WHERE a = '((((((' AND b = \"))))\"");
+    }
+
+    #[test]
+    fn deeply_nested_parens_are_rejected_not_aborted() {
+        let n = 10_000;
+        let sql = format!(
+            "SELECT * FROM t WHERE {}a = 1{}",
+            "(".repeat(n),
+            ")".repeat(n)
+        );
+        let err = parse(&sql).unwrap_err().to_string();
+        assert!(
+            err.contains("too deeply nested") || err.contains("too long"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_not_is_rejected_not_aborted() {
+        let sql = format!("SELECT * FROM t WHERE {}a = 1", "NOT ".repeat(10_000));
+        let err = parse(&sql).unwrap_err().to_string();
+        assert!(
+            err.contains("too deeply nested") || err.contains("too long"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_unary_minus_is_rejected_not_aborted() {
+        let sql = format!("SELECT * FROM t WHERE a = {}1", "- ".repeat(10_000));
+        let err = parse(&sql).unwrap_err().to_string();
+        assert!(
+            err.contains("too deeply nested") || err.contains("too long"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn overlong_sql_is_rejected() {
+        let sql = format!("SELECT * FROM t WHERE a = '{}'", "x".repeat(MAX_SQL_LEN));
+        assert!(parse(&sql).unwrap_err().to_string().contains("too long"));
     }
 
     #[test]
