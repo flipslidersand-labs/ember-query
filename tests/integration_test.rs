@@ -221,17 +221,8 @@ fn test_group_by_sum_order_by_key() -> Result<()> {
         "SELECT region, SUM(qty) FROM orders GROUP BY region ORDER BY region",
     )?;
     // east: 3+7+2 = 12, west: 5+2+4 = 11
-    // SUM currently yields Float64 ("12.0"); SQL would give integer 12 for an
-    // integer column. Compare numerically so the test is strict on values only.
-    let rows = rows_of(&batches);
-    let parsed: Vec<(String, f64)> = rows
-        .iter()
-        .map(|r| (r[0].clone(), r[1].parse::<f64>().unwrap()))
-        .collect();
-    assert_eq!(
-        parsed,
-        vec![("east".to_string(), 12.0), ("west".to_string(), 11.0)]
-    );
+    // SUM(Int64) stays Int64, so the rendered values are exact integers.
+    assert_eq!(rows_of(&batches), strs(&[&["east", "12"], &["west", "11"]]));
     Ok(())
 }
 
