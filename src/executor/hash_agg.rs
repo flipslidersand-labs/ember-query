@@ -441,4 +441,246 @@ mod tests {
             .unwrap();
         assert_eq!(t.value(0), 4.0);
     }
+
+    // ── #12: grouped / value / edge-case tests ──
+
+    use arrow::array::{BooleanArray, Float64Array as F64};
+
+    fn make_exec(cols: Vec<(&str, ArrayRef)>, empty: bool) -> Box<dyn Executor> {
+        let schema = Arc::new(Schema::new(
+            cols.iter()
+                .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
+                .collect::<Vec<_>>(),
+        ));
+        let batches = if empty {
+            vec![]
+        } else {
+            let arrays = cols.into_iter().map(|(_, a)| a).collect();
+            vec![RecordBatch::try_new(schema.clone(), arrays).unwrap()]
+        };
+        Box::new(MockExec { schema, batches })
+    }
+
+    fn run_group(
+        cols: Vec<(&str, ArrayRef)>,
+        group_by: &[&str],
+        aggs: Vec<(AggFunc, Expr, String)>,
+    ) -> RecordBatch {
+        let input = make_exec(cols, false);
+        let gb = group_by.iter().map(|s| s.to_string()).collect();
+        HashAggExec::new(input, gb, aggs)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+    }
+
+    fn ints(v: Vec<Option<i64>>) -> ArrayRef {
+        Arc::new(v.into_iter().collect::<Int64Array>())
+    }
+
+    fn f64s(out: &RecordBatch, i: usize) -> &F64 {
+        out.column(i).as_any().downcast_ref::<F64>().unwrap()
+    }
+
+    fn i64s(out: &RecordBatch, i: usize) -> &Int64Array {
+        out.column(i).as_any().downcast_ref::<Int64Array>().unwrap()
+    }
+
+    fn all_aggs() -> Vec<(AggFunc, Expr, String)> {
+        vec![
+            (AggFunc::Sum, col("v"), "sum".into()),
+            (AggFunc::Avg, col("v"), "avg".into()),
+            (AggFunc::Min, col("v"), "min".into()),
+            (AggFunc::Max, col("v"), "max".into()),
+        ]
+    }
+
+    #[test]
+    fn group_by_string_keeps_first_seen_order() {
+        let k: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "a"]));
+        let out = run_group(
+            vec![("k", k), ("v", ints(vec![Some(1), Some(2), Some(3)]))],
+            &["k"],
+            vec![
+                (AggFunc::Sum, col("v"), "t".into()),
+                (AggFunc::Count, Expr::Wildcard, "c".into()),
+            ],
+        );
+        let keys = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!((keys.value(0), keys.value(1)), ("a", "b"));
+        assert_eq!((f64s(&out, 1).value(0), f64s(&out, 1).value(1)), (4.0, 2.0));
+        assert_eq!((i64s(&out, 2).value(0), i64s(&out, 2).value(1)), (2, 1));
+    }
+
+    #[test]
+    fn group_by_int_column() {
+        let k = ints(vec![Some(10), Some(20), Some(10), Some(20), Some(10)]);
+        let v = ints(vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        let out = run_group(
+            vec![("k", k), ("v", v)],
+            &["k"],
+            vec![(AggFunc::Sum, col("v"), "t".into())],
+        );
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(i64s(&out, 0).value(0), 10);
+        assert_eq!(i64s(&out, 0).value(1), 20);
+        assert_eq!(f64s(&out, 1).value(0), 9.0);
+        assert_eq!(f64s(&out, 1).value(1), 6.0);
+    }
+
+    #[test]
+    fn group_by_bool_column() {
+        let k: ArrayRef = Arc::new(BooleanArray::from(vec![true, false, true]));
+        let out = run_group(
+            vec![("k", k), ("v", ints(vec![Some(1), Some(2), Some(3)]))],
+            &["k"],
+            vec![(AggFunc::Sum, col("v"), "t".into())],
+        );
+        let keys = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(out.num_rows(), 2);
+        assert!(keys.value(0));
+        assert!(!keys.value(1));
+        assert_eq!(f64s(&out, 1).value(0), 4.0);
+        assert_eq!(f64s(&out, 1).value(1), 2.0);
+    }
+
+    #[test]
+    fn null_group_key_forms_its_own_group() {
+        let k = ints(vec![Some(1), None, None, Some(1)]);
+        let out = run_group(
+            vec![
+                ("k", k),
+                ("v", ints(vec![Some(1), Some(2), Some(3), Some(4)])),
+            ],
+            &["k"],
+            vec![(AggFunc::Sum, col("v"), "t".into())],
+        );
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(i64s(&out, 0).value(0), 1);
+        assert!(out.column(0).is_null(1));
+        assert_eq!(f64s(&out, 1).value(0), 5.0);
+        assert_eq!(f64s(&out, 1).value(1), 5.0);
+    }
+
+    #[test]
+    fn sum_avg_min_max_with_negative_values() {
+        let out = run_agg(vec![Some(-5), Some(-1), Some(-3)], all_aggs());
+        assert_eq!(f64s(&out, 0).value(0), -9.0);
+        assert_eq!(f64s(&out, 1).value(0), -3.0);
+        // max must be -1, not an initial 0.
+        assert_eq!(f64s(&out, 2).value(0), -5.0);
+        assert_eq!(f64s(&out, 3).value(0), -1.0);
+    }
+
+    #[test]
+    fn min_max_with_all_positive_values() {
+        // min must be 5, not an initial 0.
+        let out = run_agg(vec![Some(5), Some(9), Some(7)], all_aggs());
+        assert_eq!(f64s(&out, 2).value(0), 5.0);
+        assert_eq!(f64s(&out, 3).value(0), 9.0);
+    }
+
+    #[test]
+    fn all_equal_values() {
+        let out = run_agg(vec![Some(7), Some(7), Some(7)], all_aggs());
+        assert_eq!(f64s(&out, 0).value(0), 21.0);
+        assert_eq!(f64s(&out, 1).value(0), 7.0);
+        assert_eq!(f64s(&out, 2).value(0), 7.0);
+        assert_eq!(f64s(&out, 3).value(0), 7.0);
+    }
+
+    #[test]
+    fn single_row_min_max() {
+        let out = run_agg(vec![Some(-2)], all_aggs());
+        assert_eq!(f64s(&out, 2).value(0), -2.0);
+        assert_eq!(f64s(&out, 3).value(0), -2.0);
+    }
+
+    #[test]
+    fn avg_min_max_skip_nulls() {
+        // AVG = (1 + 3) / 2, not / 3.
+        let out = run_agg(vec![Some(1), None, Some(3)], all_aggs());
+        assert_eq!(f64s(&out, 1).value(0), 2.0);
+        assert_eq!(f64s(&out, 2).value(0), 1.0);
+        assert_eq!(f64s(&out, 3).value(0), 3.0);
+    }
+
+    #[test]
+    fn avg_min_max_are_null_when_all_values_null() {
+        let out = run_agg(vec![None, None], all_aggs());
+        for i in 0..4 {
+            assert!(out.column(i).is_null(0), "column {i} should be NULL");
+        }
+    }
+
+    #[test]
+    fn empty_input_without_group_by_yields_one_row() {
+        let mut aggs = all_aggs();
+        aggs.push((AggFunc::Count, Expr::Wildcard, "c".into()));
+        let out = run_agg(vec![], aggs);
+        assert_eq!(out.num_rows(), 1);
+        for i in 0..4 {
+            assert!(out.column(i).is_null(0), "column {i} should be NULL");
+        }
+        assert_eq!(i64s(&out, 4).value(0), 0);
+    }
+
+    #[test]
+    fn empty_input_with_group_by_yields_zero_rows() {
+        let k: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+        let input = make_exec(vec![("k", k), ("v", ints(vec![]))], true);
+        let mut exec = HashAggExec::new(
+            input,
+            vec!["k".to_string()],
+            vec![(AggFunc::Count, Expr::Wildcard, "c".into())],
+        )
+        .unwrap();
+        let out = exec.next().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.num_columns(), 2);
+    }
+
+    #[test]
+    fn unknown_group_by_column_is_an_error() {
+        let input = make_exec(vec![("v", ints(vec![Some(1)]))], false);
+        let res = HashAggExec::new(
+            input,
+            vec!["nope".to_string()],
+            vec![(AggFunc::Count, Expr::Wildcard, "c".into())],
+        );
+        let err = res.err().expect("expected error");
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn output_schema_types() {
+        let k: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
+        let input = make_exec(vec![("k", k), ("v", ints(vec![Some(1)]))], false);
+        let mut aggs = all_aggs();
+        aggs.push((AggFunc::Count, Expr::Wildcard, "c".into()));
+        let exec = HashAggExec::new(input, vec!["k".to_string()], aggs).unwrap();
+        let s = exec.schema();
+        let types: Vec<_> = s.fields().iter().map(|f| f.data_type().clone()).collect();
+        assert_eq!(
+            types,
+            vec![
+                DataType::Utf8,
+                DataType::Float64,
+                DataType::Float64,
+                DataType::Float64,
+                DataType::Float64,
+                DataType::Int64
+            ]
+        );
+    }
 }
