@@ -351,3 +351,322 @@ mod neg_tests {
         assert_eq!(got, &Float64Array::from(vec![Some(-1.5), None, Some(2.0)]));
     }
 }
+
+#[cfg(test)]
+mod eval_semantics_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    const T: Option<bool> = Some(true);
+    const F: Option<bool> = Some(false);
+    const N: Option<bool> = None;
+
+    /// a/b は 3x3 の全組合せ(true,false,NULL)。
+    fn batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Boolean, true),
+            Field::new("b", DataType::Boolean, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BooleanArray::from(vec![T, T, T, F, F, F, N, N, N])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![T, F, N, T, F, N, T, F, N])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(0),
+                    None,
+                    Some(7),
+                    Some(-4),
+                    Some(2),
+                    Some(3),
+                    Some(5),
+                    Some(9),
+                ])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![
+                    Some(1.0),
+                    Some(0.0),
+                    None,
+                    Some(1.0),
+                    Some(0.0),
+                    None,
+                    Some(1.0),
+                    Some(0.0),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("apple"),
+                    Some("banana"),
+                    None,
+                    Some("apple"),
+                    Some("banana"),
+                    None,
+                    Some("apple"),
+                    Some("banana"),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
+        Expr::BinOp {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+
+    fn un(op: UnaryOp, e: Expr) -> Expr {
+        Expr::Unary {
+            op,
+            expr: Box::new(e),
+        }
+    }
+
+    fn col(n: &str) -> Expr {
+        Expr::Column(n.to_string())
+    }
+
+    fn lit(v: Value) -> Expr {
+        Expr::Literal(v)
+    }
+
+    fn bools(arr: &ArrayRef) -> Vec<Option<bool>> {
+        arr.as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("boolean array")
+            .iter()
+            .collect()
+    }
+
+    // ── NOT ──
+
+    #[test]
+    fn not_true_false_null() {
+        let b = batch();
+        let got = evaluate(&b, &un(UnaryOp::Not, col("a"))).unwrap();
+        assert_eq!(bools(&got), vec![F, F, F, T, T, T, N, N, N]);
+    }
+
+    #[test]
+    fn not_on_int_is_error() {
+        let err = evaluate(&batch(), &un(UnaryOp::Not, col("n"))).unwrap_err();
+        assert!(err.to_string().contains("NOT requires boolean"), "{err}");
+    }
+
+    #[test]
+    #[ignore = "不具合: NULL リテラルが Int64 配列になり NOT NULL がエラーになる(SQL では NULL)"]
+    fn not_null_literal_is_null() {
+        let got = evaluate(&batch(), &un(UnaryOp::Not, lit(Value::Null))).unwrap();
+        assert_eq!(bools(&got), vec![N; 9]);
+    }
+
+    // ── Neg(i64::MIN は neg_tests 側) ──
+
+    #[test]
+    fn neg_on_utf8_is_error() {
+        let err = evaluate(&batch(), &un(UnaryOp::Neg, col("s"))).unwrap_err();
+        assert!(err.to_string().contains("NEG requires numeric"), "{err}");
+    }
+
+    #[test]
+    fn neg_on_bool_is_error() {
+        assert!(evaluate(&batch(), &un(UnaryOp::Neg, col("a"))).is_err());
+    }
+
+    // ── Literal(Null) ──
+
+    #[test]
+    fn null_literal_is_all_null_with_batch_length() {
+        let got = evaluate(&batch(), &lit(Value::Null)).unwrap();
+        assert_eq!(got.len(), 9);
+        assert_eq!(got.null_count(), 9);
+    }
+
+    #[test]
+    fn null_propagates_through_arithmetic_and_comparison() {
+        let b = batch();
+        let add = evaluate(&b, &bin(BinOp::Add, col("n"), lit(Value::Int(1)))).unwrap();
+        assert!(add.is_null(2));
+        assert!(!add.is_null(0));
+        let eq = evaluate(&b, &bin(BinOp::Eq, col("n"), lit(Value::Int(1)))).unwrap();
+        assert_eq!(bools(&eq)[0], T);
+        assert_eq!(bools(&eq)[2], N);
+        // NULL リテラルとの比較は NULL
+        let eq_null = evaluate(&b, &bin(BinOp::Eq, col("n"), lit(Value::Null))).unwrap();
+        assert_eq!(bools(&eq_null), vec![N; 9]);
+    }
+
+    // ── AND / OR ──
+
+    #[test]
+    #[ignore = "不具合: arrow の compute::and は Kleene でなく、FALSE AND NULL / NULL AND FALSE が NULL になる"]
+    fn and_three_valued_logic_table() {
+        let e = bin(BinOp::And, col("a"), col("b"));
+        let got = evaluate(&batch(), &e).unwrap();
+        // 期待: FALSE AND NULL = FALSE、NULL AND FALSE = FALSE(Kleene)
+        assert_eq!(bools(&got), vec![T, F, N, F, F, F, N, F, N]);
+    }
+
+    #[test]
+    #[ignore = "不具合: arrow の compute::or は Kleene でなく、TRUE OR NULL / NULL OR TRUE が NULL になる"]
+    fn or_three_valued_logic_table() {
+        let e = bin(BinOp::Or, col("a"), col("b"));
+        let got = evaluate(&batch(), &e).unwrap();
+        // 期待: TRUE OR NULL = TRUE、NULL OR TRUE = TRUE(Kleene)
+        assert_eq!(bools(&got), vec![T, T, T, T, F, N, T, N, N]);
+    }
+
+    #[test]
+    fn and_or_null_rows_where_kleene_and_current_agree() {
+        // Kleene と現状実装で結果が一致する NULL 行(NULL 伝播の回帰検出用)
+        let b = batch();
+        let and = bools(&evaluate(&b, &bin(BinOp::And, col("a"), col("b"))).unwrap());
+        let or = bools(&evaluate(&b, &bin(BinOp::Or, col("a"), col("b"))).unwrap());
+        // (a,b) = (T,N) (N,T) (N,N) の AND は NULL
+        assert_eq!([and[2], and[6], and[8]], [N, N, N]);
+        // (F,N) (N,F) (N,N) の OR は NULL
+        assert_eq!([or[5], or[7], or[8]], [N, N, N]);
+    }
+
+    #[test]
+    fn and_or_without_nulls_two_valued() {
+        let b = batch();
+        let and = evaluate(&b, &bin(BinOp::And, col("a"), col("b"))).unwrap();
+        let or = evaluate(&b, &bin(BinOp::Or, col("a"), col("b"))).unwrap();
+        // NULL を含まない行(0,1,3,4)だけ確認
+        for (i, (ea, eo)) in [(0, (T, T)), (1, (F, T)), (3, (F, T)), (4, (F, F))] {
+            assert_eq!(bools(&and)[i], ea, "AND row {i}");
+            assert_eq!(bools(&or)[i], eo, "OR row {i}");
+        }
+    }
+
+    #[test]
+    fn and_or_on_non_boolean_is_error() {
+        let b = batch();
+        for op in [BinOp::And, BinOp::Or] {
+            let lhs = evaluate(&b, &bin(op.clone(), col("n"), col("a"))).unwrap_err();
+            assert!(lhs.to_string().contains("requires boolean lhs"), "{lhs}");
+            let rhs = evaluate(&b, &bin(op, col("a"), col("n"))).unwrap_err();
+            assert!(rhs.to_string().contains("requires boolean rhs"), "{rhs}");
+        }
+    }
+
+    #[test]
+    #[ignore = "不具合: NULL リテラルが Int64 配列になり `x AND NULL` / `x OR NULL` が型エラーになる"]
+    fn and_or_with_null_literal() {
+        let b = batch();
+        // TRUE AND NULL = NULL, FALSE AND NULL = FALSE
+        let and = evaluate(&b, &bin(BinOp::And, col("a"), lit(Value::Null))).unwrap();
+        assert_eq!(bools(&and), vec![N, N, N, F, F, F, N, N, N]);
+        // TRUE OR NULL = TRUE, FALSE OR NULL = NULL
+        let or = evaluate(&b, &bin(BinOp::Or, col("a"), lit(Value::Null))).unwrap();
+        assert_eq!(bools(&or), vec![T, T, T, N, N, N, N, N, N]);
+    }
+
+    // ── ゼロ除算 ──
+
+    #[test]
+    fn int_division_by_zero_is_error() {
+        let e = bin(BinOp::Div, lit(Value::Int(1)), lit(Value::Int(0)));
+        let err = evaluate(&batch(), &e).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("divide by zero"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn int_column_division_by_zero_row_is_error() {
+        // n = [1, 0, ...] なので 1 / n の 2 行目でゼロ除算
+        let e = bin(BinOp::Div, lit(Value::Int(1)), col("n"));
+        assert!(evaluate(&batch(), &e).is_err());
+    }
+
+    #[test]
+    #[ignore = "不具合: Float のゼロ除算が inf / NaN を黙って返す(Int はエラーで不整合。SQL ではエラーまたは NULL)"]
+    fn float_division_by_zero_is_not_inf() {
+        let e = bin(BinOp::Div, lit(Value::Float(1.0)), lit(Value::Float(0.0)));
+        match evaluate(&batch(), &e) {
+            Err(_) => {}
+            Ok(arr) => {
+                let f = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+                assert!(f.iter().all(|v| v.is_none_or(|x| x.is_finite())));
+            }
+        }
+    }
+
+    // ── 文字列比較 ──
+
+    #[test]
+    fn utf8_eq_and_lt() {
+        let b = batch();
+        let eq = evaluate(
+            &b,
+            &bin(BinOp::Eq, col("s"), lit(Value::Str("apple".into()))),
+        )
+        .unwrap();
+        assert_eq!(bools(&eq), vec![T, F, N, T, F, N, T, F, N]);
+        let lt = evaluate(&b, &bin(BinOp::Lt, col("s"), lit(Value::Str("b".into())))).unwrap();
+        assert_eq!(bools(&lt), vec![T, F, N, T, F, N, T, F, N]);
+        // 境界: "banana" < "banana" は false(Le への変異を検出)
+        let lt_eq_val = evaluate(
+            &b,
+            &bin(BinOp::Lt, col("s"), lit(Value::Str("banana".into()))),
+        )
+        .unwrap();
+        assert_eq!(bools(&lt_eq_val), vec![T, F, N, T, F, N, T, F, N]);
+        let ne = evaluate(
+            &b,
+            &bin(BinOp::Ne, col("s"), lit(Value::Str("apple".into()))),
+        )
+        .unwrap();
+        assert_eq!(bools(&ne), vec![F, T, N, F, T, N, F, T, N]);
+    }
+
+    #[test]
+    fn int_column_eq_string_literal_is_error() {
+        let e = bin(BinOp::Eq, col("n"), lit(Value::Str("1".into())));
+        assert!(evaluate(&batch(), &e).is_err());
+    }
+
+    #[test]
+    fn string_column_lt_int_literal_is_error() {
+        let e = bin(BinOp::Lt, col("s"), lit(Value::Int(1)));
+        assert!(evaluate(&batch(), &e).is_err());
+    }
+
+    // ── 未知カラム ──
+
+    #[test]
+    fn unknown_column_error_message_lists_schema() {
+        let err = evaluate(&batch(), &col("nope")).unwrap_err().to_string();
+        assert!(err.contains("column 'nope' not found"), "{err}");
+        for name in ["a", "b", "n", "f", "s"] {
+            assert!(err.contains(&format!("\"{name}\"")), "{err}");
+        }
+    }
+
+    #[test]
+    fn unknown_column_nested_in_binop_propagates() {
+        let e = bin(BinOp::Add, col("n"), col("nope"));
+        let err = evaluate(&batch(), &e).unwrap_err().to_string();
+        assert!(err.contains("column 'nope' not found"), "{err}");
+    }
+
+    // ── evaluate_bool ──
+
+    #[test]
+    fn evaluate_bool_rejects_non_boolean() {
+        let err = evaluate_bool(&batch(), &col("n")).unwrap_err();
+        assert!(
+            err.to_string().contains("did not evaluate to boolean"),
+            "{err}"
+        );
+    }
+}
