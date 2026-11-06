@@ -207,6 +207,8 @@ enum ScalarKey {
     Int(i64),
     Str(String),
     Bool(bool),
+    /// Float bits; -0.0 is folded into 0.0 and all NaNs into one NaN so they group together.
+    Float(u64),
     Null,
 }
 
@@ -223,9 +225,16 @@ fn scalar_at(arr: &ArrayRef, row: usize) -> ScalarKey {
     if let Some(a) = arr.as_any().downcast_ref::<arrow::array::BooleanArray>() {
         return ScalarKey::Bool(a.value(row));
     }
-    // Float — convert to ordered bits for hashing (lossy but workable for GROUP BY)
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return ScalarKey::Str(a.value(row).to_string());
+        let v = a.value(row);
+        let v = if v.is_nan() {
+            f64::NAN
+        } else if v == 0.0 {
+            0.0
+        } else {
+            v
+        };
+        return ScalarKey::Float(v.to_bits());
     }
     ScalarKey::Null
 }
@@ -270,6 +279,16 @@ fn build_group_column(
             for key in key_order {
                 match key.get(col_idx) {
                     Some(ScalarKey::Str(s)) => b.append_value(s),
+                    _ => b.append_null(),
+                }
+            }
+            Ok(Arc::new(b.finish()) as ArrayRef)
+        }
+        DataType::Float64 => {
+            let mut b = Float64Builder::new();
+            for key in key_order {
+                match key.get(col_idx) {
+                    Some(ScalarKey::Float(bits)) => b.append_value(f64::from_bits(*bits)),
                     _ => b.append_null(),
                 }
             }
@@ -552,6 +571,34 @@ mod tests {
         assert!(!keys.value(1));
         assert_eq!(f64s(&out, 1).value(0), 4.0);
         assert_eq!(f64s(&out, 1).value(1), 2.0);
+    }
+
+    #[test]
+    fn group_by_float_column_keeps_float64_type() {
+        let k: ArrayRef = Arc::new(F64::from(vec![
+            Some(1.5),
+            Some(2.25),
+            Some(1.5),
+            None,
+            Some(-0.0),
+            Some(0.0),
+        ]));
+        let v = ints(vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]);
+        let out = run_group(
+            vec![("k", k), ("v", v)],
+            &["k"],
+            vec![(AggFunc::Sum, col("v"), "t".into())],
+        );
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Float64);
+        assert_eq!(out.column(0).data_type(), &DataType::Float64);
+        let keys = f64s(&out, 0);
+        // 1.5, 2.25, NULL, 0.0 (-0.0 and 0.0 are the same group)
+        assert_eq!(out.num_rows(), 4);
+        assert_eq!((keys.value(0), keys.value(1)), (1.5, 2.25));
+        assert!(arrow::array::Array::is_null(keys, 2));
+        assert_eq!(keys.value(3), 0.0);
+        assert_eq!(f64s(&out, 1).value(0), 4.0);
+        assert_eq!(f64s(&out, 1).value(3), 11.0);
     }
 
     #[test]
