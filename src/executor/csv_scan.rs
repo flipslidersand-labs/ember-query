@@ -13,15 +13,21 @@ pub struct CsvScanExec {
     reader: csv::Reader<std::fs::File>,
     schema: SchemaRef,
     done: bool,
+    line_offset: u64,
 }
 
 impl CsvScanExec {
     pub fn new(path: &str, table_schema: TableSchema) -> Result<Self> {
-        let reader = csv::ReaderBuilder::new()
+        let mut reader = csv::ReaderBuilder::new()
             .has_headers(true)
             .flexible(true) // short records pad with NULL; long ones are rejected in next()
             .from_path(path)
             .map_err(|e| anyhow!("cannot open CSV '{}': {}", path, e))?;
+
+        reader
+            .headers()
+            .map_err(|e| anyhow!("cannot read CSV header '{}': {}", path, e))?;
+        let line_offset = crate::catalog::physical_line_offset(&reader);
 
         let fields: Vec<Field> = table_schema
             .columns
@@ -34,6 +40,7 @@ impl CsvScanExec {
             reader,
             schema,
             done: false,
+            line_offset,
         })
     }
 }
@@ -59,10 +66,11 @@ impl Executor for CsvScanExec {
         let mut rows_read = 0usize;
         for result in self.reader.records().take(BATCH_SIZE) {
             let record = result?;
+            let line = crate::catalog::record_line(&record, self.line_offset);
             if record.len() > n_cols {
                 return Err(anyhow!(
-                    "record {} has {} fields, expected at most {}",
-                    rows_read + 1,
+                    "record at line {} has {} fields, expected at most {}",
+                    line,
                     record.len(),
                     n_cols
                 ));
@@ -70,7 +78,6 @@ impl Executor for CsvScanExec {
             for (col_idx, builder) in builders.iter_mut().enumerate() {
                 let val = record.get(col_idx).unwrap_or("");
                 builder.append(val).map_err(|e| {
-                    let line = record.position().map(|p| p.line()).unwrap_or(0);
                     anyhow!(
                         "line {}, column '{}': {}",
                         line,
@@ -356,6 +363,32 @@ mod tests {
         assert!(msg.contains("line 4"), "got: {}", msg);
         assert!(msg.contains("column 'n'"), "got: {}", msg);
         assert!(msg.contains("N/A"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_error_line_is_physical_with_crlf() {
+        let f = TmpCsv::new("s,n\r\na,1\r\na,1\r\na,1\r\na,1\r\nb,N/A\r\n");
+        let ts = schema_of(&[("s", DataType::Utf8), ("n", DataType::Int64)]);
+        let msg = scan_all(&f, ts).unwrap_err().to_string();
+        assert!(msg.contains("line 6"), "got: {}", msg);
+    }
+
+    #[test]
+    fn too_many_fields_error_has_physical_line_across_batches() {
+        let mut s = String::from("a\n");
+        for _ in 0..BATCH_SIZE + 5 {
+            s.push_str("1\n");
+        }
+        s.push_str("1,2\n");
+        let f = TmpCsv::new(&s);
+        let msg = scan_all(&f, schema_of(&[("a", DataType::Int64)]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(&format!("line {}", BATCH_SIZE + 7)),
+            "got: {}",
+            msg
+        );
     }
 
     #[test]
