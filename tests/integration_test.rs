@@ -974,3 +974,21 @@ fn test_q86_duplicate_table_alias_is_error() {
     let sql = "SELECT * FROM t1 JOIN t1 ON t1.id = t1.id";
     assert!(run_query_with_catalog(&fixture("t1.csv"), sql).is_ok());
 }
+
+// #94: NaN を含む Float 列の MIN/MAX は行順に依存しない(ORDER BY と同じ全順序)。
+#[test]
+fn test_min_max_nan_is_row_order_independent() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ember_query_94_{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    for (name, body) in [
+        ("nan_first.csv", "x\nnan\n1.5\n"),
+        ("nan_last.csv", "x\n1.5\nnan\n"),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, body)?;
+        let batches = run_query(path.to_str().unwrap(), "SELECT MIN(x), MAX(x) FROM data")?;
+        assert_eq!(rows_of(&batches), strs(&[&["1.5", "NaN"]]), "{name}");
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
