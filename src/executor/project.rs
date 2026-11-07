@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
-use super::{evaluate, Executor};
+use super::{evaluate, field_ref, resolve_column, Executor};
 use crate::sql::ast::{Expr, SelectItem};
 
 pub struct ProjectExec {
@@ -23,9 +23,9 @@ impl ProjectExec {
             match item {
                 SelectItem::Wildcard => {
                     // Expand all columns
+                    // `table.column` so a JOIN's colliding bare names stay unambiguous.
                     for field in in_schema.fields() {
-                        projections
-                            .push((field.name().clone(), Expr::Column(field.name().clone())));
+                        projections.push((field.name().clone(), Expr::Column(field_ref(field))));
                     }
                 }
                 SelectItem::Expr(expr, alias) => {
@@ -40,7 +40,16 @@ impl ProjectExec {
             .iter()
             .map(|(name, expr)| {
                 let dt = infer_expr_type(expr, &in_schema);
-                Field::new(name, dt, true)
+                let f = Field::new(name, dt, true);
+                // A plain column keeps its source tag so a Sort above can
+                // still resolve `t.col` (e.g. `SELECT * ... ORDER BY t2.id`).
+                match expr {
+                    Expr::Column(c) => match resolve_column(&in_schema, c) {
+                        Ok(i) => f.with_metadata(in_schema.field(i).metadata().clone()),
+                        Err(_) => f,
+                    },
+                    _ => f,
+                }
             })
             .collect();
 
