@@ -212,11 +212,15 @@ fn merge_schemas(left: &Schema, right: &Schema) -> Schema {
     let mut fields: Vec<Field> = left.fields().iter().map(|f| f.as_ref().clone()).collect();
     for f in right.fields() {
         if left_names.contains(f.name().as_str()) {
-            fields.push(Field::new(
-                format!("right_{}", f.name()),
-                f.data_type().clone(),
-                f.is_nullable(),
-            ));
+            // Keep the (table, column) tag so `t.col` still finds it (#40).
+            fields.push(
+                Field::new(
+                    format!("right_{}", f.name()),
+                    f.data_type().clone(),
+                    f.is_nullable(),
+                )
+                .with_metadata(f.metadata().clone()),
+            );
         } else {
             fields.push(f.as_ref().clone());
         }
