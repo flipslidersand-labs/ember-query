@@ -195,7 +195,16 @@ fn apply_binop(op: &BinOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
         BinOp::Add => Ok(numeric_kernels::add(l, r)?),
         BinOp::Sub => Ok(numeric_kernels::sub(l, r)?),
         BinOp::Mul => Ok(numeric_kernels::mul(l, r)?),
-        BinOp::Div => Ok(numeric_kernels::div(l, r)?),
+        BinOp::Div => {
+            // arrow の Float 除算は inf / NaN を返す。Int(Divide by zero エラー)に揃える。
+            // NULL の行は検出対象外(NULL のまま)。0.0 と -0.0 は `== 0.0` で両方一致。
+            if let Some(d) = r.as_any().downcast_ref::<Float64Array>() {
+                if d.iter().any(|v| v == Some(0.0)) {
+                    return Err(arrow::error::ArrowError::DivideByZero.into());
+                }
+            }
+            Ok(numeric_kernels::div(l, r)?)
+        }
 
         // Comparison — returns BooleanArray
         BinOp::Eq => Ok(Arc::new(kcmp::eq(l, r)?) as ArrayRef),
@@ -622,7 +631,6 @@ mod eval_semantics_tests {
     }
 
     #[test]
-    #[ignore = "不具合: Float のゼロ除算が inf / NaN を黙って返す(Int はエラーで不整合。SQL ではエラーまたは NULL)"]
     fn float_division_by_zero_is_not_inf() {
         let e = bin(BinOp::Div, lit(Value::Float(1.0)), lit(Value::Float(0.0)));
         match evaluate(&batch(), &e) {
@@ -632,6 +640,57 @@ mod eval_semantics_tests {
                 assert!(f.iter().all(|v| v.is_none_or(|x| x.is_finite())));
             }
         }
+    }
+
+    fn div_f(l: Float64Array, r: Float64Array) -> Result<ArrayRef> {
+        let b = RecordBatch::try_from_iter([
+            ("l", Arc::new(l) as ArrayRef),
+            ("r", Arc::new(r) as ArrayRef),
+        ])
+        .unwrap();
+        evaluate(&b, &bin(BinOp::Div, col("l"), col("r")))
+    }
+
+    #[test]
+    fn float_division_by_zero_matches_int_error() {
+        for z in [0.0, -0.0] {
+            let err =
+                div_f(Float64Array::from(vec![1.0]), Float64Array::from(vec![z])).unwrap_err();
+            assert!(
+                err.to_string().to_lowercase().contains("divide by zero"),
+                "{err}"
+            );
+        }
+        // 0.0 / 0.0 (NaN になる場合)も同様
+        assert!(div_f(Float64Array::from(vec![0.0]), Float64Array::from(vec![0.0])).is_err());
+        // 行の途中のゼロ
+        assert!(div_f(
+            Float64Array::from(vec![1.0, 2.0]),
+            Float64Array::from(vec![2.0, 0.0])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mixed_int_float_division_by_zero_is_error() {
+        // Int 列 / Float 0.0 (昇格後)
+        let e = bin(BinOp::Div, col("n"), lit(Value::Float(0.0)));
+        assert!(evaluate(&batch(), &e).is_err());
+        // Float / Int 0
+        let e = bin(BinOp::Div, lit(Value::Float(1.0)), lit(Value::Int(0)));
+        assert!(evaluate(&batch(), &e).is_err());
+    }
+
+    #[test]
+    fn float_division_null_divisor_stays_null() {
+        // 除数 NULL の行はエラーにせず NULL。非ゼロ除数は通常どおり
+        let got = div_f(
+            Float64Array::from(vec![Some(1.0), Some(2.0), None]),
+            Float64Array::from(vec![Some(2.0), None, Some(4.0)]),
+        )
+        .unwrap();
+        let f = got.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(f, &Float64Array::from(vec![Some(0.5), None, None]));
     }
 
     // ── 文字列比較 ──
