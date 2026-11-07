@@ -13,7 +13,7 @@ use anyhow::{anyhow, Result};
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute;
 use arrow::compute::kernels::numeric as numeric_kernels;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -74,15 +74,16 @@ pub fn evaluate(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
         Expr::Literal(val) => make_scalar_array(val, batch.num_rows()),
 
         Expr::BinOp { op, left, right } => {
-            let l = evaluate(batch, left)?;
-            let r = evaluate(batch, right)?;
+            let l = evaluate_operand(batch, left)?;
+            let r = evaluate_operand(batch, right)?;
             apply_binop(op, &l, &r)
         }
 
         Expr::Unary { op, expr } => {
-            let arr = evaluate(batch, expr)?;
+            let arr = evaluate_operand(batch, expr)?;
             match op {
                 UnaryOp::Not => {
+                    let arr = coerce_null(&arr, &DataType::Boolean)?;
                     let bool_arr = arr
                         .as_any()
                         .downcast_ref::<BooleanArray>()
@@ -90,6 +91,7 @@ pub fn evaluate(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
                     Ok(Arc::new(compute::not(bool_arr)?) as ArrayRef)
                 }
                 UnaryOp::Neg => {
+                    let arr = coerce_null(&arr, &DataType::Int64)?;
                     // Negate numeric column
                     if let Some(i64_arr) = arr.as_any().downcast_ref::<Int64Array>() {
                         let negated: Int64Array = i64_arr
@@ -141,6 +143,26 @@ pub fn evaluate_bool(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// 演算子のオペランドを評価する。NULL リテラルだけは型未定(`DataType::Null`)のまま返し、
+/// 演算側で相手の型に合わせる。単独の `SELECT NULL` は従来どおり Int64 の NULL 配列。
+fn evaluate_operand(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
+    match expr {
+        Expr::Literal(Value::Null) => Ok(arrow::array::new_null_array(
+            &DataType::Null,
+            batch.num_rows(),
+        )),
+        _ => evaluate(batch, expr),
+    }
+}
+
+fn coerce_null(arr: &ArrayRef, target: &DataType) -> Result<ArrayRef> {
+    if matches!(arr.data_type(), DataType::Null) {
+        Ok(compute::cast(arr, target)?)
+    } else {
+        Ok(arr.clone())
+    }
+}
+
 fn make_scalar_array(val: &Value, len: usize) -> Result<ArrayRef> {
     match val {
         Value::Int(i) => {
@@ -168,7 +190,19 @@ fn make_scalar_array(val: &Value, len: usize) -> Result<ArrayRef> {
 
 fn apply_binop(op: &BinOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
     use arrow::compute::kernels::cmp as kcmp;
-    use arrow::datatypes::DataType;
+
+    // NULL リテラル(DataType::Null)は相手の型に揃える。論理演算は Boolean、両辺 NULL の算術・比較は Int64
+    let (nl, nr) = (
+        matches!(l.data_type(), DataType::Null),
+        matches!(r.data_type(), DataType::Null),
+    );
+    let target = match op {
+        BinOp::And | BinOp::Or => DataType::Boolean,
+        _ if nl && !nr => r.data_type().clone(),
+        _ if nr && !nl => l.data_type().clone(),
+        _ => DataType::Int64,
+    };
+    let (l, r) = (&coerce_null(l, &target)?, &coerce_null(r, &target)?);
 
     // Int64 と Float64 の混在は Int64 側を Float64 に揃える(arrow は暗黙変換しない)
     let (l, r) = match (l.data_type(), r.data_type()) {
@@ -182,7 +216,16 @@ fn apply_binop(op: &BinOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
         BinOp::Add => Ok(numeric_kernels::add(l, r)?),
         BinOp::Sub => Ok(numeric_kernels::sub(l, r)?),
         BinOp::Mul => Ok(numeric_kernels::mul(l, r)?),
-        BinOp::Div => Ok(numeric_kernels::div(l, r)?),
+        BinOp::Div => {
+            // arrow の Float 除算は inf / NaN を返す。Int(Divide by zero エラー)に揃える。
+            // NULL の行は検出対象外(NULL のまま)。0.0 と -0.0 は `== 0.0` で両方一致。
+            if let Some(d) = r.as_any().downcast_ref::<Float64Array>() {
+                if d.iter().any(|v| v == Some(0.0)) {
+                    return Err(arrow::error::ArrowError::DivideByZero.into());
+                }
+            }
+            Ok(numeric_kernels::div(l, r)?)
+        }
 
         // Comparison — returns BooleanArray
         BinOp::Eq => Ok(Arc::new(kcmp::eq(l, r)?) as ArrayRef),
@@ -484,7 +527,6 @@ mod eval_semantics_tests {
     }
 
     #[test]
-    #[ignore = "不具合: NULL リテラルが Int64 配列になり NOT NULL がエラーになる(SQL では NULL)"]
     fn not_null_literal_is_null() {
         let got = evaluate(&batch(), &un(UnaryOp::Not, lit(Value::Null))).unwrap();
         assert_eq!(bools(&got), vec![N; 9]);
@@ -580,7 +622,6 @@ mod eval_semantics_tests {
     }
 
     #[test]
-    #[ignore = "不具合: NULL リテラルが Int64 配列になり `x AND NULL` / `x OR NULL` が型エラーになる"]
     fn and_or_with_null_literal() {
         let b = batch();
         // TRUE AND NULL = NULL, FALSE AND NULL = FALSE
@@ -611,7 +652,6 @@ mod eval_semantics_tests {
     }
 
     #[test]
-    #[ignore = "不具合: Float のゼロ除算が inf / NaN を黙って返す(Int はエラーで不整合。SQL ではエラーまたは NULL)"]
     fn float_division_by_zero_is_not_inf() {
         let e = bin(BinOp::Div, lit(Value::Float(1.0)), lit(Value::Float(0.0)));
         match evaluate(&batch(), &e) {
@@ -621,6 +661,57 @@ mod eval_semantics_tests {
                 assert!(f.iter().all(|v| v.is_none_or(|x| x.is_finite())));
             }
         }
+    }
+
+    fn div_f(l: Float64Array, r: Float64Array) -> Result<ArrayRef> {
+        let b = RecordBatch::try_from_iter([
+            ("l", Arc::new(l) as ArrayRef),
+            ("r", Arc::new(r) as ArrayRef),
+        ])
+        .unwrap();
+        evaluate(&b, &bin(BinOp::Div, col("l"), col("r")))
+    }
+
+    #[test]
+    fn float_division_by_zero_matches_int_error() {
+        for z in [0.0, -0.0] {
+            let err =
+                div_f(Float64Array::from(vec![1.0]), Float64Array::from(vec![z])).unwrap_err();
+            assert!(
+                err.to_string().to_lowercase().contains("divide by zero"),
+                "{err}"
+            );
+        }
+        // 0.0 / 0.0 (NaN になる場合)も同様
+        assert!(div_f(Float64Array::from(vec![0.0]), Float64Array::from(vec![0.0])).is_err());
+        // 行の途中のゼロ
+        assert!(div_f(
+            Float64Array::from(vec![1.0, 2.0]),
+            Float64Array::from(vec![2.0, 0.0])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mixed_int_float_division_by_zero_is_error() {
+        // Int 列 / Float 0.0 (昇格後)
+        let e = bin(BinOp::Div, col("n"), lit(Value::Float(0.0)));
+        assert!(evaluate(&batch(), &e).is_err());
+        // Float / Int 0
+        let e = bin(BinOp::Div, lit(Value::Float(1.0)), lit(Value::Int(0)));
+        assert!(evaluate(&batch(), &e).is_err());
+    }
+
+    #[test]
+    fn float_division_null_divisor_stays_null() {
+        // 除数 NULL の行はエラーにせず NULL。非ゼロ除数は通常どおり
+        let got = div_f(
+            Float64Array::from(vec![Some(1.0), Some(2.0), None]),
+            Float64Array::from(vec![Some(2.0), None, Some(4.0)]),
+        )
+        .unwrap();
+        let f = got.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(f, &Float64Array::from(vec![Some(0.5), None, None]));
     }
 
     // ── 文字列比較 ──
