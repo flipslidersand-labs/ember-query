@@ -811,6 +811,17 @@ fn test_table_alias_without_as() -> Result<()> {
     Ok(())
 }
 
+// #97: 重複ヘッダは黙って先頭列を返さず、列名つきのエラーにする。
+#[test]
+fn test_duplicate_header_is_error() {
+    let p = std::env::temp_dir().join(format!("ember_query_dup_header_{}.csv", std::process::id()));
+    std::fs::write(&p, "id,id\n1,2\n").unwrap();
+    let err = run_query(p.to_str().unwrap(), "SELECT id FROM data").unwrap_err();
+    let _ = std::fs::remove_file(&p);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("duplicate") && msg.contains("'id'"), "{msg}");
+}
+
 // #92: table aliases and the FROM name tag the columns; #86: unknown qualifiers fail.
 
 const Q92_T1: &str = "id,name,v\n1,a,10\n2,b,20\n";
