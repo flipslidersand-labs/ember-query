@@ -102,7 +102,10 @@ add_op   = { "+" | "-" }
 mul_expr = { unary_expr ~ (mul_op ~ unary_expr)* }
 mul_op   = { "*" | "/" }
 
-unary_expr = { ("-" ~ unary_expr) | primary }
+// primary を先に試す: 負の数リテラル(-1)は literal として拾い、
+// それ以外の "-" だけが neg_op として pair になる(無名トークンは pair にならない)
+unary_expr = { primary | (neg_op ~ unary_expr) }
+neg_op     = { "-" }
 
 primary = {
     "(" ~ expr ~ ")"
