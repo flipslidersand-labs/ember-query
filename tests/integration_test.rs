@@ -86,6 +86,15 @@ fn test_project_arithmetic_expr_is_int64() -> Result<()> {
 }
 
 #[test]
+fn test_float_division_by_zero_is_error() {
+    let err = run_query(&sample_csv(), "SELECT price / 0.0 FROM data").unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("divide by zero"),
+        "{err}"
+    );
+}
+
+#[test]
 fn test_project_comparison_expr_is_boolean() -> Result<()> {
     use arrow::datatypes::DataType;
     assert_eq!(types_of("SELECT price > 1 FROM data")?, [DataType::Boolean]);
@@ -289,6 +298,109 @@ fn test_error_unknown_from_table() {
     assert!(res.is_err(), "unknown table file must be an error");
 }
 
+// ---------------------------------------------------------------------------
+// Unary minus (#71)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unary_minus_negates_column() -> Result<()> {
+    let b = run_query(&fixture("orders.csv"), "SELECT -qty FROM orders")?;
+    assert_eq!(rows_of(&b)[..3], strs(&[&["-3"], &["-5"], &["-2"]])[..]);
+    Ok(())
+}
+
+#[test]
+fn test_unary_minus_in_where() -> Result<()> {
+    // 修正前は -qty が qty として評価され、全行が落ちる(0 件)
+    let b = run_query(
+        &fixture("orders.csv"),
+        "SELECT order_id FROM orders WHERE -qty < 0",
+    )?;
+    let all = run_query(&fixture("orders.csv"), "SELECT order_id FROM orders")?;
+    assert_eq!(rows_of(&b), rows_of(&all));
+    let none = run_query(
+        &fixture("orders.csv"),
+        "SELECT order_id FROM orders WHERE -qty > 0",
+    )?;
+    assert!(rows_of(&none).is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_unary_minus_double_and_binary() -> Result<()> {
+    let b = run_query(
+        &fixture("orders.csv"),
+        "SELECT - -qty, qty - -1, qty - 1 FROM orders",
+    )?;
+    assert_eq!(rows_of(&b)[0], ["3", "4", "2"]);
+    Ok(())
+}
+
+#[test]
+fn test_unary_minus_i64_min_overflows_via_sql() {
+    let res = run_query(&fixture("minint.csv"), "SELECT -v FROM minint");
+    let err = res.expect_err("-i64::MIN must overflow").to_string();
+    assert!(err.contains("integer overflow"), "got: {err}");
+}
+
+// 負リテラル: master では -1 が 1 と評価されていた(#71 と同根)。
+// orders.csv の qty は 2 以上なので `qty > -1` 単独では master と差が出ない。
+// 差が出る `qty - -1 = 4`(master は qty - 1 = 4 で qty=5 の行)を境界に使う。
+#[test]
+fn test_negative_literal_keeps_sign_in_where() -> Result<()> {
+    let b = run_query(
+        &fixture("orders.csv"),
+        "SELECT order_id FROM orders WHERE qty - -1 = 4",
+    )?;
+    assert_eq!(rows_of(&b)[0], ["101"]); // qty=3
+    let all = rows_of(&run_query(
+        &fixture("orders.csv"),
+        "SELECT order_id FROM orders",
+    )?);
+    let gt = run_query(
+        &fixture("orders.csv"),
+        "SELECT order_id FROM orders WHERE qty > -1",
+    )?;
+    assert_eq!(rows_of(&gt), all);
+    Ok(())
+}
+
+#[test]
+fn test_negative_literal_in_projection() -> Result<()> {
+    let b = run_query(&fixture("orders.csv"), "SELECT -1, qty - -1 FROM orders")?;
+    assert_eq!(rows_of(&b)[0], ["-1", "4"]);
+    Ok(())
+}
+
+#[test]
+fn test_negative_i64_min_literal_parses() -> Result<()> {
+    let b = run_query(
+        &fixture("orders.csv"),
+        "SELECT -9223372036854775808 FROM orders",
+    )?;
+    assert_eq!(rows_of(&b)[0], ["-9223372036854775808"]);
+    Ok(())
+}
+
+// 100 段の単項マイナスが評価まで届く(パースだけでなく結果が正しい)。
+// 偶数段なので qty のまま、奇数段なら符号反転。
+// 注: `- -qty` のような偶数段は master でも qty として通るため、検出力は
+// 奇数段(test_unary_minus_negates_column / 下の 101 段)側にある。
+#[test]
+fn test_deep_unary_minus_evaluates() -> Result<()> {
+    let even = format!("SELECT {}qty FROM orders", "- ".repeat(100));
+    let odd = format!("SELECT {}qty FROM orders", "- ".repeat(101));
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &even)?)[0],
+        ["3"]
+    );
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &odd)?)[0],
+        ["-3"]
+    );
+    Ok(())
+}
+
 // ── #41: aggregate queries honour the SELECT list ────────────────────────────
 
 #[test]
@@ -360,4 +472,17 @@ fn test_agg_alias_colliding_with_auto_name_is_error() {
     );
     let err = res.expect_err("duplicate aggregate output name must be an error");
     assert!(err.to_string().contains("duplicate"), "{err}");
+}
+
+// -AGG(...) は #71 で Unary{Agg} になる。列が黙って消えず、#74 の
+// 「集約を式に埋め込めない」エラーになること。
+#[test]
+fn test_agg_under_unary_minus_is_unsupported_error() {
+    for sql in [
+        "SELECT region, -COUNT(*) FROM orders GROUP BY region",
+        "SELECT region, -SUM(qty) FROM orders GROUP BY region",
+    ] {
+        let err = run_query(&fixture("orders.csv"), sql).expect_err(sql);
+        assert!(err.to_string().contains("not supported"), "{sql}: {err}");
+    }
 }
