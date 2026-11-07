@@ -572,6 +572,52 @@ fn test_join_qualified_unique_columns_still_resolve() -> Result<()> {
     Ok(())
 }
 
+// #78: aggregate ORDER BY resolves SELECT aliases.
+
+#[test]
+fn test_agg_order_by_group_column_alias() -> Result<()> {
+    let sql = |dir: &str| {
+        format!("SELECT region AS r, COUNT(*) FROM orders GROUP BY region ORDER BY r {dir}")
+    };
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &sql("DESC"))?),
+        strs(&[&["west", "3"], &["east", "3"]])
+    );
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &sql("ASC"))?),
+        strs(&[&["east", "3"], &["west", "3"]])
+    );
+    Ok(())
+}
+
+#[test]
+fn test_agg_order_by_aggregate_alias() -> Result<()> {
+    let sql = |dir: &str| {
+        format!(
+            "SELECT region, COUNT(*) AS c FROM orders WHERE order_id != 105 GROUP BY region ORDER BY c {dir}"
+        )
+    };
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &sql("DESC"))?),
+        strs(&[&["west", "3"], &["east", "2"]])
+    );
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &sql("ASC"))?),
+        strs(&[&["east", "2"], &["west", "3"]])
+    );
+    Ok(())
+}
+
+#[test]
+fn test_agg_qualified_select_column_with_unqualified_group_by() -> Result<()> {
+    let batches = run_query(
+        &fixture("orders.csv"),
+        "SELECT orders.region, COUNT(*) FROM orders GROUP BY region ORDER BY region",
+    )?;
+    assert_eq!(rows_of(&batches), strs(&[&["east", "3"], &["west", "3"]]));
+    Ok(())
+}
+
 // -AGG(...) は #71 で Unary{Agg} になる。列が黙って消えず、#74 の
 // 「集約を式に埋め込めない」エラーになること。
 #[test]
