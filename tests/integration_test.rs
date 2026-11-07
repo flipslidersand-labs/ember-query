@@ -811,6 +811,61 @@ fn test_table_alias_without_as() -> Result<()> {
     Ok(())
 }
 
+// #96: 日本語ヘッダの CSV を列名・表名として参照できる
+#[test]
+fn test_unicode_identifiers_select_where_order_group() -> Result<()> {
+    let path = fixture("jp.csv");
+    let b = run_query(
+        &path,
+        "SELECT 名前 FROM jp WHERE 価格 > 100 ORDER BY 価格 DESC",
+    )?;
+    assert_eq!(rows_of(&b), strs(&[&["ぶどう"], &["もも"], &["りんご"]]));
+
+    let b = run_query(
+        &path,
+        "SELECT 地域, COUNT(*) AS 件数, SUM(価格) FROM jp GROUP BY 地域 ORDER BY 地域",
+    )?;
+    assert_eq!(
+        rows_of(&b),
+        strs(&[&["大阪", "2", "330"], &["東京", "2", "420"]])
+    );
+    Ok(())
+}
+
+#[test]
+fn test_unicode_table_name_join() -> Result<()> {
+    let path = fixture("jp.csv");
+    let b = run_query_with_catalog(
+        &path,
+        "SELECT jp.名前, 地域.売上 FROM jp JOIN 地域 ON jp.地域 = 地域.地域 \
+         WHERE 地域.売上 > 10 ORDER BY jp.名前",
+    )?;
+    assert_eq!(rows_of(&b), strs(&[&["みかん", "20"], &["もも", "20"]]));
+    Ok(())
+}
+
+#[test]
+fn test_join_table_name_cannot_contain_path_chars() {
+    for sql in [
+        "SELECT * FROM jp JOIN ../jp ON 1 = 1",
+        "SELECT * FROM jp JOIN a/b ON 1 = 1",
+        "SELECT * FROM jp JOIN a\\b ON 1 = 1",
+    ] {
+        assert!(ember_query::sql::parse(sql).is_err(), "{sql}");
+    }
+}
+
+// #97: 重複ヘッダは黙って先頭列を返さず、列名つきのエラーにする。
+#[test]
+fn test_duplicate_header_is_error() {
+    let p = std::env::temp_dir().join(format!("ember_query_dup_header_{}.csv", std::process::id()));
+    std::fs::write(&p, "id,id\n1,2\n").unwrap();
+    let err = run_query(p.to_str().unwrap(), "SELECT id FROM data").unwrap_err();
+    let _ = std::fs::remove_file(&p);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("duplicate") && msg.contains("'id'"), "{msg}");
+}
+
 // #92: table aliases and the FROM name tag the columns; #86: unknown qualifiers fail.
 
 const Q92_T1: &str = "id,name,v\n1,a,10\n2,b,20\n";

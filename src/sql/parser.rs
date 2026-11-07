@@ -107,7 +107,12 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
     for p in inner {
         match p.as_rule() {
             Rule::unsupported_join => {
-                let kind = p.as_str().to_uppercase();
+                let kind = p
+                    .as_str()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .next()
+                    .unwrap_or("")
+                    .to_uppercase();
                 bail!("{kind} JOIN is not supported (only [INNER] JOIN)");
             }
             Rule::join_clause => {
@@ -927,12 +932,23 @@ mod tests {
         for kind in ["LEFT", "left", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER"] {
             for sql in [
                 format!("SELECT * FROM t1 {kind} JOIN t2 ON t1.id = t2.t1_id"),
+                format!("SELECT * FROM t1 {kind} JOIN t2"),
                 format!("SELECT * FROM t1 a {kind} JOIN t2 b ON a.id = b.t1_id"),
             ] {
                 let e = parse(&sql).unwrap_err().to_string();
                 assert!(e.contains("not supported"), "{sql}: {e}");
             }
         }
+        // ON-less kinds still get the explicit error, not a generic syntax error.
+        for sql in [
+            "SELECT * FROM t1 CROSS JOIN t2",
+            "SELECT * FROM t1 NATURAL JOIN t2",
+            "SELECT * FROM t1 NATURAL LEFT JOIN t2 WHERE t1.id = 1",
+        ] {
+            let e = parse(sql).unwrap_err().to_string();
+            assert!(e.contains("JOIN is not supported"), "{sql}: {e}");
+        }
+        assert!(parse("SELECT * FROM t1 LEFT").is_err());
         let e = parse("SELECT * FROM t1 LEFT OUTER JOIN t2 ON t1.id = t2.t1_id")
             .unwrap_err()
             .to_string();
@@ -985,5 +1001,51 @@ mod tests {
         // identifiers that merely start with a keyword are valid aliases
         assert!(parse("SELECT * FROM t order_x").is_ok());
         assert!(parse("SELECT * FROM t AS").is_err());
+    }
+
+    #[test]
+    fn unicode_identifiers_in_all_positions() {
+        let s = parse(
+            "SELECT 名前, 地域.売上 AS 合計 FROM 売上表 地域 \
+             WHERE 価格 > 100 GROUP BY 地域 ORDER BY 価格 DESC",
+        )
+        .unwrap();
+        assert_eq!(
+            s.select[0],
+            SelectItem::Expr(Expr::Column("名前".into()), None)
+        );
+        assert_eq!(s.order_by[0].column, "価格");
+        assert_eq!(s.group_by, vec!["地域".to_string()]);
+    }
+
+    #[test]
+    fn keyword_followed_by_unicode_is_one_identifier() {
+        // `SELECT名前` is a single identifier, not SELECT + 名前
+        assert!(parse("SELECT名前 FROM t").is_err());
+        assert!(parse("SELECT a FROM t WHERE x = 1 ORDERさ BY a").is_err());
+        // identifier that starts with a keyword and continues with Unicode
+        let s = parse("SELECT ORDER名 FROM t").unwrap();
+        assert_eq!(
+            s.select[0],
+            SelectItem::Expr(Expr::Column("ORDER名".into()), None)
+        );
+        // Unicode directly after a keyword with a space still works
+        assert!(parse("SELECT * FROM t WHERE 名前 = 'a' AND 価格 > 1").is_ok());
+    }
+
+    #[test]
+    fn path_characters_are_not_identifier_characters() {
+        for sql in [
+            "SELECT * FROM a/b",
+            "SELECT * FROM ..",
+            "SELECT * FROM a\\b",
+            "SELECT * FROM t JOIN ../x ON 1 = 1",
+            "SELECT * FROM t JOIN 表/x ON 1 = 1",
+            "SELECT * FROM t JOIN 表\\x ON 1 = 1",
+        ] {
+            assert!(parse(sql).is_err(), "{sql}");
+        }
+        // `.` never becomes part of a table name: `a.b` is not a valid table_ref
+        assert!(parse("SELECT * FROM a.b").is_err());
     }
 }
