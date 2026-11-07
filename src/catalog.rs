@@ -26,6 +26,27 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
     let headers: Vec<String> = reader.headers()?.iter().map(|h| h.to_string()).collect();
     let line_offset = physical_line_offset(&reader);
 
+    // 空名・重複名は列が黙って参照不能になるためエラー(大文字小文字違いは別名)。
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, h) in headers.iter().enumerate() {
+        if h.is_empty() {
+            anyhow::bail!(
+                "empty column name at column {} in header of {}",
+                i + 1,
+                path.display()
+            );
+        }
+        if let Some(first) = seen.insert(h.as_str(), i + 1) {
+            anyhow::bail!(
+                "duplicate column name '{}' (column {} and column {}) in header of {}",
+                h,
+                first,
+                i + 1,
+                path.display()
+            );
+        }
+    }
+
     // Scan every row once, keeping only per-column flags (no records retained),
     // so the inferred type always matches what the scan will parse.
     let mut states = vec![ColState::default(); headers.len()];
@@ -250,6 +271,41 @@ mod tests {
         let msg = infer_schema(&f.0).unwrap_err().to_string();
         assert!(msg.contains("line 151"), "got: {}", msg);
         assert!(msg.contains("3 fields"), "got: {}", msg);
+    }
+
+    #[test]
+    fn duplicate_header_is_error() {
+        let f = TmpCsv::new("id,name,id\n1,a,2\n");
+        let err = infer_schema(&f.0).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(err.contains("'id'"), "{err}");
+        assert!(err.contains("column 3"), "{err}");
+        assert!(err.contains(&f.0.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn empty_header_is_error() {
+        let f = TmpCsv::new("a,,c\n1,2,3\n");
+        let err = infer_schema(&f.0).unwrap_err().to_string();
+        assert!(err.contains("empty"), "{err}");
+        assert!(err.contains("column 2"), "{err}");
+        assert!(err.contains(&f.0.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn headers_differing_only_in_case_are_ok() {
+        let f = TmpCsv::new("Id,id\n1,2\n");
+        let ts = infer_schema(&f.0).unwrap();
+        assert_eq!(ts.columns[0].name, "Id");
+        assert_eq!(ts.columns[1].name, "id");
+    }
+
+    #[test]
+    fn distinct_headers_unchanged() {
+        let f = TmpCsv::new("a,b,c\n1,2,3\n");
+        let ts = infer_schema(&f.0).unwrap();
+        let names: Vec<&str> = ts.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
     }
 
     #[test]

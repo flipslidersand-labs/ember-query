@@ -3,13 +3,21 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
-use super::{evaluate, field_ref, resolve_column, Executor};
+use super::{evaluate, resolve_column, Executor};
 use crate::sql::ast::{Expr, SelectItem};
+
+/// An output column: an input column by position, or an expression.
+enum Proj {
+    /// From `SELECT *`. Bound by position so a self-JOIN's `id` and
+    /// `right_id`, both tagged `t1.id`, stay distinct (#92).
+    Input(usize),
+    Expr(Expr),
+}
 
 pub struct ProjectExec {
     input: Box<dyn Executor>,
-    /// (output field name, expression)
-    projections: Vec<(String, Expr)>,
+    /// (output field name, source)
+    projections: Vec<(String, Proj)>,
     out_schema: SchemaRef,
 }
 
@@ -17,20 +25,19 @@ impl ProjectExec {
     pub fn new(input: Box<dyn Executor>, exprs: Vec<SelectItem>) -> Result<Self> {
         let in_schema = input.schema();
 
-        let mut projections: Vec<(String, Expr)> = Vec::new();
+        let mut projections: Vec<(String, Proj)> = Vec::new();
 
         for item in &exprs {
             match item {
                 SelectItem::Wildcard => {
                     // Expand all columns
-                    // `table.column` so a JOIN's colliding bare names stay unambiguous.
-                    for field in in_schema.fields() {
-                        projections.push((field.name().clone(), Expr::Column(field_ref(field))));
+                    for (i, field) in in_schema.fields().iter().enumerate() {
+                        projections.push((field.name().clone(), Proj::Input(i)));
                     }
                 }
                 SelectItem::Expr(expr, alias) => {
                     let name = alias.clone().unwrap_or_else(|| expr_name(expr, &in_schema));
-                    projections.push((name, expr.clone()));
+                    projections.push((name, Proj::Expr(expr.clone())));
                 }
             }
         }
@@ -38,19 +45,27 @@ impl ProjectExec {
         // Build output schema
         let fields: Vec<Field> = projections
             .iter()
-            .map(|(name, expr)| {
-                let dt = infer_expr_type(expr, &in_schema);
-                let f = Field::new(name, dt, true);
-                // A plain, unaliased column keeps its source tag so a Sort above can
-                // still resolve `t.col` (e.g. `SELECT * ... ORDER BY t2.id`).
-                match expr {
-                    Expr::Column(c) => match resolve_column(&in_schema, c) {
-                        Ok(i) if c == name || in_schema.field(i).name() == name => {
-                            f.with_metadata(in_schema.field(i).metadata().clone())
-                        }
+            .map(|(name, proj)| match proj {
+                // Keeps the source tag so a Sort above can still resolve `t.col`.
+                Proj::Input(i) => {
+                    let src = in_schema.field(*i);
+                    Field::new(name, src.data_type().clone(), true)
+                        .with_metadata(src.metadata().clone())
+                }
+                Proj::Expr(expr) => {
+                    let dt = infer_expr_type(expr, &in_schema);
+                    let f = Field::new(name, dt, true);
+                    // A plain, unaliased column keeps its source tag so a Sort above can
+                    // still resolve `t.col` (e.g. `SELECT t2.id ... ORDER BY t2.id`).
+                    match expr {
+                        Expr::Column(c) => match resolve_column(&in_schema, c) {
+                            Ok(i) if c == name || in_schema.field(i).name() == name => {
+                                f.with_metadata(in_schema.field(i).metadata().clone())
+                            }
+                            _ => f,
+                        },
                         _ => f,
-                    },
-                    _ => f,
+                    }
                 }
             })
             .collect();
@@ -77,7 +92,10 @@ impl Executor for ProjectExec {
                 let columns = self
                     .projections
                     .iter()
-                    .map(|(_, expr)| evaluate(&batch, expr))
+                    .map(|(_, proj)| match proj {
+                        Proj::Input(i) => Ok(batch.column(*i).clone()),
+                        Proj::Expr(expr) => evaluate(&batch, expr),
+                    })
                     .collect::<Result<Vec<_>>>()?;
 
                 RecordBatch::try_new(self.out_schema.clone(), columns)

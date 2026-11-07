@@ -30,9 +30,27 @@ impl HashJoinExec {
         on: &Expr,
     ) -> Result<Self> {
         // Extract equality columns from the ON expression
-        let (left_col, right_col) = extract_eq_columns(on).ok_or_else(|| {
+        let (mut left_col, mut right_col) = extract_eq_columns(on).ok_or_else(|| {
             anyhow!("JOIN ON must be an equality expression (left_col = right_col)")
         })?;
+        // Orient the ON sides by table tag: `b.id = a.v` probes with `a.v`.
+        // A side naming only the other input's table must never fall back to
+        // name matching there (a self-JOIN would silently swap columns, #92).
+        let (ls, rs) = (left.schema(), right.schema());
+        let misplaced = |l: &str, r: &str| {
+            let only = |c: &str, here: &Schema, there: &Schema| {
+                tagged_in(here, c) == Some(true) && tagged_in(there, c) == Some(false)
+            };
+            only(l, &rs, &ls) || only(r, &ls, &rs)
+        };
+        if misplaced(&left_col, &right_col) {
+            std::mem::swap(&mut left_col, &mut right_col);
+            if misplaced(&left_col, &right_col) {
+                return Err(anyhow!(
+                    "JOIN ON '{right_col} = {left_col}' must compare a column of each side"
+                ));
+            }
+        }
 
         // Collect all right batches into a hash map: right_key_value → [row_index, batch_index]
         let mut right_batches: Vec<RecordBatch> = Vec::new();
@@ -152,6 +170,13 @@ fn extract_eq_columns(on: &Expr) -> Option<(String, String)> {
     } else {
         None
     }
+}
+
+/// Whether `col`'s qualifier is a table tag of `schema`; `None` if unqualified.
+fn tagged_in(schema: &Schema, col: &str) -> Option<bool> {
+    let (q, _) = col.rsplit_once('.')?;
+    let tag = |f: &Arc<Field>| f.metadata().get(super::TABLE_KEY).cloned();
+    Some(schema.fields().iter().any(|f| tag(f).as_deref() == Some(q)))
 }
 
 fn column_name(expr: &Expr) -> Option<String> {
