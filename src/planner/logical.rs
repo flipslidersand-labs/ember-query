@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::catalog::TableSchema;
+use crate::executor::same_column;
 use crate::sql::ast::{AggFunc, Expr, OrderByItem, SelectItem, SelectStmt};
 
 /// Logical plan node.
@@ -178,7 +179,7 @@ pub fn build(
             group_by: stmt.group_by.clone(),
             aggs,
         };
-        plan = sort_node(plan, &stmt.order_by);
+        plan = sort_node(plan, &resolve_order_aliases(&stmt.select, &stmt.order_by));
     } else if let Some(order_by) = hidden_order_by(&stmt.select, &stmt.order_by) {
         // 5/6. ORDER BY refers to columns the SELECT list drops: sort the
         // Project's input, then project.
@@ -261,7 +262,7 @@ fn contains_agg(expr: &Expr) -> bool {
 /// Non-aggregate SELECT expressions may only use GROUP BY columns.
 fn check_grouped(expr: &Expr, group_by: &[String]) -> Result<()> {
     match expr {
-        Expr::Column(c) if !group_by.contains(c) => anyhow::bail!(
+        Expr::Column(c) if !group_by.iter().any(|g| same_column(g, c)) => anyhow::bail!(
             "column '{}' must appear in the GROUP BY clause or be used in an aggregate function",
             c
         ),
@@ -301,28 +302,30 @@ fn hidden_order_by(select: &[SelectItem], order_by: &[OrderByItem]) -> Option<Ve
         _ => None,
     };
     let names: Vec<String> = select.iter().filter_map(out_name).collect();
-    let in_output = |col: &str| {
-        let bare = col.split('.').next_back().unwrap_or(col);
-        names.iter().any(|n| n == col || n == bare)
-    };
+    let in_output = |col: &str| names.iter().any(|n| same_column(n, col));
     if order_by.iter().all(|o| in_output(&o.column)) {
         return None;
     }
-    Some(
-        order_by
-            .iter()
-            .map(|o| {
-                let source = select.iter().find_map(|i| match i {
-                    SelectItem::Expr(Expr::Column(c), Some(a)) if *a == o.column => Some(c),
-                    _ => None,
-                });
-                OrderByItem {
-                    column: source.cloned().unwrap_or_else(|| o.column.clone()),
-                    ..o.clone()
-                }
-            })
-            .collect(),
-    )
+    Some(resolve_order_aliases(select, order_by))
+}
+
+/// Rewrite ORDER BY keys that name the alias of a plain-column SELECT item to
+/// that source column; other keys are kept. Shared by the aggregate and
+/// non-aggregate paths.
+fn resolve_order_aliases(select: &[SelectItem], order_by: &[OrderByItem]) -> Vec<OrderByItem> {
+    order_by
+        .iter()
+        .map(|o| {
+            let source = select.iter().find_map(|i| match i {
+                SelectItem::Expr(Expr::Column(c), Some(a)) if *a == o.column => Some(c),
+                _ => None,
+            });
+            OrderByItem {
+                column: source.cloned().unwrap_or_else(|| o.column.clone()),
+                ..o.clone()
+            }
+        })
+        .collect()
 }
 
 /// Extract aggregate calls from the SELECT list.

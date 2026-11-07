@@ -3,7 +3,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, Stri
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use super::Executor;
+use super::{resolve_column, Executor};
 use crate::sql::ast::OrderByItem;
 
 /// Sort executor — collects all input rows, sorts in-memory, then streams output.
@@ -54,11 +54,8 @@ impl SortExec {
         let sort_cols: Vec<(usize, bool)> = order_by
             .iter()
             .map(|ob| {
-                let col_name = strip_table_prefix(&ob.column);
-                let idx = schema
-                    .index_of(col_name)
-                    .or_else(|_| schema.index_of(&ob.column))
-                    .map_err(|_| anyhow!("ORDER BY column '{}' not found", ob.column))?;
+                let idx = resolve_column(&schema, &ob.column)
+                    .map_err(|e| anyhow!("ORDER BY column '{}': {}", ob.column, e))?;
                 Ok((idx, ob.asc))
             })
             .collect::<Result<_>>()?;
@@ -115,10 +112,6 @@ impl Executor for SortExec {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-}
-
-fn strip_table_prefix(col: &str) -> &str {
-    col.split('.').next_back().unwrap_or(col)
 }
 
 /// Compare two rows of one column. NULLS LAST regardless of `asc`:
