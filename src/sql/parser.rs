@@ -94,8 +94,9 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
     let select_list = inner.next().ok_or_else(|| anyhow!("missing select_list"))?;
     let select = parse_select_list(select_list)?;
 
-    // table_ref: the primary table path is resolved by the caller, so only consume it here.
-    inner.next().ok_or_else(|| anyhow!("missing table_ref"))?;
+    // table_ref: the file is found by the caller; the name/alias tag its columns (#92).
+    let (name, alias) = parse_table_ref(inner.next().ok_or_else(|| anyhow!("missing table_ref"))?);
+    let from = super::ast::TableRef { name, alias };
 
     let mut joins = Vec::new();
     let mut where_ = None;
@@ -143,6 +144,7 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
 
     Ok(SelectStmt {
         select,
+        from,
         joins,
         where_,
         group_by,
@@ -151,23 +153,28 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
     })
 }
 
-/// Table name of a `table_ref` (the optional alias is accepted by the grammar but not used).
-fn parse_table_ref(pair: Pair<Rule>) -> String {
-    pair.into_inner()
-        .next()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_default()
+/// Table name and optional alias of a `table_ref`.
+fn parse_table_ref(pair: Pair<Rule>) -> (String, Option<String>) {
+    let (mut name, mut alias) = (String::new(), None);
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::table_alias => alias = Some(p.as_str().to_string()),
+            _ if name.is_empty() => name = p.as_str().to_string(),
+            _ => {}
+        }
+    }
+    (name, alias)
 }
 
 fn parse_join_clause(pair: Pair<Rule>) -> Result<super::ast::JoinClause> {
     let mut inner = pair.into_inner();
     let table_ref = inner.next().ok_or_else(|| anyhow!("JOIN missing table"))?;
-    let table = parse_table_ref(table_ref);
+    let (table, alias) = parse_table_ref(table_ref);
     let on_pair = inner
         .next()
         .ok_or_else(|| anyhow!("JOIN missing ON expr"))?;
     let on = parse_expr(on_pair)?;
-    Ok(super::ast::JoinClause { table, on })
+    Ok(super::ast::JoinClause { table, alias, on })
 }
 
 fn parse_order_item(pair: Pair<Rule>) -> super::ast::OrderByItem {
@@ -921,6 +928,14 @@ mod tests {
         assert!(s.where_.is_some());
         let s = parse("SELECT * FROM t JOIN u AS y ON t.a = y.a").unwrap();
         assert_eq!(s.joins[0].table, "u");
+        // #92: the alias is kept and becomes the qualifier tag.
+        assert_eq!(s.joins[0].alias.as_deref(), Some("y"));
+        assert_eq!((s.from.tag(), s.joins[0].tag()), ("t", "y"));
+        let s = parse("SELECT * FROM t x JOIN u ON x.a = u.a").unwrap();
+        assert_eq!(
+            (s.from.name.as_str(), s.from.tag(), s.joins[0].tag()),
+            ("t", "x", "u")
+        );
     }
 
     #[test]
