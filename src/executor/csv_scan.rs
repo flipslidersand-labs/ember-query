@@ -16,25 +16,32 @@ pub struct CsvScanExec {
 }
 
 impl CsvScanExec {
+    /// Scan tagged with the file stem (tests only; plans pass the SQL tag).
+    #[cfg(test)]
     pub fn new(path: &str, table_schema: TableSchema) -> Result<Self> {
+        let stem = std::path::Path::new(path).file_stem();
+        let stem = stem
+            .and_then(|t| t.to_str())
+            .unwrap_or_default()
+            .to_string();
+        Self::with_table(path, table_schema, &stem)
+    }
+
+    /// Tag each column with `table` (the FROM/JOIN alias or name, not the
+    /// file name) so `t.col` resolves exactly after a JOIN (#40, #92).
+    pub fn with_table(path: &str, table_schema: TableSchema, table: &str) -> Result<Self> {
         let reader = csv::ReaderBuilder::new()
             .has_headers(true)
             .flexible(true) // short records pad with NULL; long ones are rejected in next()
             .from_path(path)
             .map_err(|e| anyhow!("cannot open CSV '{}': {}", path, e))?;
 
-        // Tag each column with its table (the file stem, as main.rs maps
-        // `<table>.csv`) so `t.col` resolves exactly after a JOIN (#40).
-        let table = std::path::Path::new(path).file_stem();
         let fields: Vec<Field> = table_schema
             .columns
             .iter()
             .map(|c| {
                 let f = Field::new(&c.name, c.data_type.clone(), true);
-                match table.and_then(|t| t.to_str()) {
-                    Some(t) => super::tag_field(f, t, &c.name),
-                    None => f,
-                }
+                super::tag_field(f, table, &c.name)
             })
             .collect();
 
