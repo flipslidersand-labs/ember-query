@@ -664,8 +664,10 @@ fn test_type_mismatch_after_row_100_does_not_fail_at_runtime() -> Result<()> {
 
     let total: usize = result?.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 1);
-    if let Err(e) = issue_query {
-        assert!(!e.to_string().contains("cannot parse"), "got: {e}");
-    }
+    // Utf8 列と整数リテラルの比較は型エラー(本 Issue の範囲外)。CSV 読み取りの parse エラーではない。
+    let e = issue_query.expect_err("Utf8 == Int64 is currently a type error");
+    let msg = e.to_string();
+    assert!(!msg.contains("cannot parse"), "got: {msg}");
+    assert!(msg.contains("Utf8") && msg.contains("Int64"), "got: {msg}");
     Ok(())
 }

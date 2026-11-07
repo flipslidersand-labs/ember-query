@@ -9,14 +9,14 @@ pub struct ColumnDef {
     pub data_type: DataType,
 }
 
-/// Schema inferred from a CSV file's header + sample values.
+/// Schema inferred from a CSV file's header + every data row.
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub columns: Vec<ColumnDef>,
 }
 
-/// Infer the schema of a CSV file by reading the header row and a sample of
-/// data rows.  Type priority: i64 → f64 → String.
+/// Infer the schema of a CSV file by reading the header row and scanning every
+/// data row once.  Type priority: bool → i64 → f64 → String.
 pub fn infer_schema(path: &Path) -> Result<TableSchema> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -24,6 +24,7 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
         .from_path(path)?;
 
     let headers: Vec<String> = reader.headers()?.iter().map(|h| h.to_string()).collect();
+    let line_offset = physical_line_offset(&reader);
 
     // Scan every row once, keeping only per-column flags (no records retained),
     // so the inferred type always matches what the scan will parse.
@@ -32,7 +33,8 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
         let record = result?;
         if record.len() > headers.len() {
             anyhow::bail!(
-                "record has {} fields, expected at most {}",
+                "line {}: record has {} fields, expected at most {}",
+                record_line(&record, line_offset),
                 record.len(),
                 headers.len()
             );
@@ -51,6 +53,17 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
     }
 
     Ok(TableSchema { columns })
+}
+
+/// csv crate は CRLF ファイルでヘッダ直後の行番号を 1 小さく数える。ヘッダ読了直後の
+/// 位置(LF なら 2)との差を補正値として返す。`headers()` を読んだ後に呼ぶこと。
+pub(crate) fn physical_line_offset<R: std::io::Read>(reader: &csv::Reader<R>) -> u64 {
+    2u64.saturating_sub(reader.position().line())
+}
+
+/// レコード開始位置の物理行番号(ヘッダ=1)。
+pub(crate) fn record_line(record: &csv::StringRecord, line_offset: u64) -> u64 {
+    record.position().map(|p| p.line()).unwrap_or(0) + line_offset
 }
 
 /// Bool として受理する表記は `true`/`false`(大文字小文字不問)のみ。型推論とスキャンで共通。
@@ -224,6 +237,19 @@ mod tests {
     #[test]
     fn all_ints_beyond_100_rows_stay_int() {
         assert_eq!(types(&n_rows_then(1000, "")), vec![DataType::Int64]);
+    }
+
+    #[test]
+    fn too_many_fields_after_row_100_reports_line() {
+        let mut s = String::from("a,b\n");
+        for _ in 0..149 {
+            s.push_str("1,2\n");
+        }
+        s.push_str("1,2,3\n");
+        let f = TmpCsv::new(&s);
+        let msg = infer_schema(&f.0).unwrap_err().to_string();
+        assert!(msg.contains("line 151"), "got: {}", msg);
+        assert!(msg.contains("3 fields"), "got: {}", msg);
     }
 
     #[test]
