@@ -117,7 +117,7 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
             }
             Rule::group_by_clause => {
                 for col in p.into_inner() {
-                    if col.as_rule() == Rule::ident {
+                    if col.as_rule() == Rule::column_ref {
                         group_by.push(col.as_str().to_string());
                     }
                 }
