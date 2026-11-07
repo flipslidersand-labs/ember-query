@@ -3,7 +3,7 @@ use pest::Parser;
 use pest_derive::Parser;
 
 use super::ast::*;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 
 #[derive(Parser)]
 #[grammar = "sql/grammar.pest"]
@@ -106,6 +106,15 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
 
     for p in inner {
         match p.as_rule() {
+            Rule::unsupported_join => {
+                let kind = p
+                    .as_str()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .next()
+                    .unwrap_or("")
+                    .to_uppercase();
+                bail!("{kind} JOIN is not supported (only [INNER] JOIN)");
+            }
             Rule::join_clause => {
                 joins.push(parse_join_clause(p)?);
             }
@@ -916,6 +925,43 @@ mod tests {
         assert_eq!(s.order_by.len(), 1);
         let s = parse("SELECT * FROM t x LIMIT 1").unwrap();
         assert_eq!(s.limit, Some(1));
+    }
+
+    #[test]
+    fn unsupported_join_kinds_are_errors_not_aliases() {
+        for kind in ["LEFT", "left", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER"] {
+            for sql in [
+                format!("SELECT * FROM t1 {kind} JOIN t2 ON t1.id = t2.t1_id"),
+                format!("SELECT * FROM t1 {kind} JOIN t2"),
+                format!("SELECT * FROM t1 a {kind} JOIN t2 b ON a.id = b.t1_id"),
+            ] {
+                let e = parse(&sql).unwrap_err().to_string();
+                assert!(e.contains("not supported"), "{sql}: {e}");
+            }
+        }
+        // ON-less kinds still get the explicit error, not a generic syntax error.
+        for sql in [
+            "SELECT * FROM t1 CROSS JOIN t2",
+            "SELECT * FROM t1 NATURAL JOIN t2",
+            "SELECT * FROM t1 NATURAL LEFT JOIN t2 WHERE t1.id = 1",
+        ] {
+            let e = parse(sql).unwrap_err().to_string();
+            assert!(e.contains("JOIN is not supported"), "{sql}: {e}");
+        }
+        assert!(parse("SELECT * FROM t1 LEFT").is_err());
+        let e = parse("SELECT * FROM t1 LEFT OUTER JOIN t2 ON t1.id = t2.t1_id")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("LEFT JOIN is not supported"), "{e}");
+    }
+
+    #[test]
+    fn join_kind_prefixed_identifiers_still_work() {
+        assert!(parse("SELECT left_col FROM t").is_ok());
+        assert!(parse("SELECT * FROM t leftover").is_ok());
+        assert!(parse("SELECT * FROM t fuller JOIN u ON fuller.a = u.a").is_ok());
+        assert!(parse("SELECT * FROM t crossing WHERE crossing.a = 1").is_ok());
+        assert!(parse("SELECT * FROM t1 JOIN left_t ON t1.a = left_t.a").is_ok());
     }
 
     #[test]

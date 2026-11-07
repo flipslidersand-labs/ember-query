@@ -16,6 +16,19 @@ KW_INNER = _{ &INNER_END ~ ^"INNER" }
 INNER_END = @{ ^"INNER" ~ !ID_CONT }
 KW_JOIN = _{ &JOIN_END ~ ^"JOIN" }
 JOIN_END = @{ ^"JOIN" ~ !ID_CONT }
+// Join kinds that are not implemented; rejected with a clear error (#109).
+KW_LEFT = _{ &LEFT_END ~ ^"LEFT" }
+LEFT_END = @{ ^"LEFT" ~ !ID_CONT }
+KW_RIGHT = _{ &RIGHT_END ~ ^"RIGHT" }
+RIGHT_END = @{ ^"RIGHT" ~ !ID_CONT }
+KW_FULL = _{ &FULL_END ~ ^"FULL" }
+FULL_END = @{ ^"FULL" ~ !ID_CONT }
+KW_CROSS = _{ &CROSS_END ~ ^"CROSS" }
+CROSS_END = @{ ^"CROSS" ~ !ID_CONT }
+KW_OUTER = _{ &OUTER_END ~ ^"OUTER" }
+OUTER_END = @{ ^"OUTER" ~ !ID_CONT }
+KW_NATURAL = _{ &NATURAL_END ~ ^"NATURAL" }
+NATURAL_END = @{ ^"NATURAL" ~ !ID_CONT }
 KW_ON = _{ &ON_END ~ ^"ON" }
 ON_END = @{ ^"ON" ~ !ID_CONT }
 KW_WHERE = _{ &WHERE_END ~ ^"WHERE" }
@@ -51,7 +64,7 @@ query = { SOI ~ select_stmt ~ ";"? ~ EOI }
 select_stmt = {
     KW_SELECT ~ select_list
     ~ KW_FROM ~ table_ref
-    ~ join_clause*
+    ~ (join_clause | unsupported_join)*
     ~ where_clause?
     ~ group_by_clause?
     ~ order_by_clause?
@@ -68,9 +81,12 @@ wildcard = { "*" }
 // AS is optional; words that can follow a table_ref are never taken as an alias.
 table_ref = { table_name ~ (KW_AS? ~ table_alias)? }
 table_name  = @{ ident }
-table_alias = @{ !(KW_AS | KW_ON | KW_INNER | KW_JOIN | KW_WHERE | KW_GROUP | KW_ORDER | KW_LIMIT) ~ ident }
+table_alias = @{ !(KW_AS | KW_ON | KW_INNER | KW_JOIN | KW_LEFT | KW_RIGHT | KW_FULL | KW_CROSS | KW_OUTER | KW_NATURAL | KW_WHERE | KW_GROUP | KW_ORDER | KW_LIMIT) ~ ident }
 
 // JOIN clause (INNER JOIN only for Phase 5)
+// Consumed through the table (and optional ON) so CROSS/NATURAL JOIN without ON still
+// reaches the explicit error. Requires JOIN: a bare `FROM t LEFT` stays a syntax error.
+unsupported_join = { (KW_LEFT | KW_RIGHT | KW_FULL | KW_CROSS | KW_OUTER | KW_NATURAL) ~ ((KW_LEFT | KW_RIGHT | KW_FULL | KW_CROSS | KW_OUTER | KW_NATURAL) | KW_INNER)* ~ KW_JOIN ~ table_ref ~ (KW_ON ~ expr)? }
 join_clause = { (KW_INNER ~ KW_JOIN | KW_JOIN) ~ table_ref ~ KW_ON ~ expr }
 
 // WHERE clause
