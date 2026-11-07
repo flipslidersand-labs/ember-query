@@ -231,24 +231,30 @@ fn join_key(arr: &ArrayRef, idx: usize) -> Result<Option<JoinKey>> {
     Err(anyhow!("unsupported JOIN key type: {:?}", arr.data_type()))
 }
 
+/// Output schema of a JOIN. A right column whose name is taken gets a
+/// `right_` prefix; if that is taken too (3+ table JOINs, #101) the prefix
+/// becomes `right2_`, `right3_`, ... so output names stay unique. The
+/// (table, column) tag is kept so `t.col` still resolves (#40).
 fn merge_schemas(left: &Schema, right: &Schema) -> Schema {
-    let left_names: std::collections::HashSet<&str> =
-        left.fields().iter().map(|f| f.name().as_str()).collect();
+    let mut used: std::collections::HashSet<String> =
+        left.fields().iter().map(|f| f.name().clone()).collect();
     let mut fields: Vec<Field> = left.fields().iter().map(|f| f.as_ref().clone()).collect();
     for f in right.fields() {
-        if left_names.contains(f.name().as_str()) {
-            // Keep the (table, column) tag so `t.col` still finds it (#40).
-            fields.push(
-                Field::new(
-                    format!("right_{}", f.name()),
-                    f.data_type().clone(),
-                    f.is_nullable(),
-                )
-                .with_metadata(f.metadata().clone()),
-            );
-        } else {
+        if !used.contains(f.name().as_str()) {
+            used.insert(f.name().clone());
             fields.push(f.as_ref().clone());
+            continue;
         }
+        let name = std::iter::once("right_".to_string())
+            .chain((2..).map(|n| format!("right{n}_")))
+            .map(|p| format!("{p}{}", f.name()))
+            .find(|n| !used.contains(n))
+            .expect("unbounded iterator");
+        used.insert(name.clone());
+        fields.push(
+            Field::new(name, f.data_type().clone(), f.is_nullable())
+                .with_metadata(f.metadata().clone()),
+        );
     }
     Schema::new(fields)
 }
