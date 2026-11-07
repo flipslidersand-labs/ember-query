@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::catalog::TableSchema;
+use crate::executor::same_column;
 use crate::sql::ast::{AggFunc, Expr, OrderByItem, SelectItem, SelectStmt};
 
 /// Logical plan node.
@@ -261,7 +262,7 @@ fn contains_agg(expr: &Expr) -> bool {
 /// Non-aggregate SELECT expressions may only use GROUP BY columns.
 fn check_grouped(expr: &Expr, group_by: &[String]) -> Result<()> {
     match expr {
-        Expr::Column(c) if !group_by.contains(c) => anyhow::bail!(
+        Expr::Column(c) if !group_by.iter().any(|g| same_column(g, c)) => anyhow::bail!(
             "column '{}' must appear in the GROUP BY clause or be used in an aggregate function",
             c
         ),
@@ -301,10 +302,7 @@ fn hidden_order_by(select: &[SelectItem], order_by: &[OrderByItem]) -> Option<Ve
         _ => None,
     };
     let names: Vec<String> = select.iter().filter_map(out_name).collect();
-    let in_output = |col: &str| {
-        let bare = col.split('.').next_back().unwrap_or(col);
-        names.iter().any(|n| n == col || n == bare)
-    };
+    let in_output = |col: &str| names.iter().any(|n| same_column(n, col));
     if order_by.iter().all(|o| in_output(&o.column)) {
         return None;
     }
