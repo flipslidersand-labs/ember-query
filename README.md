@@ -1,38 +1,64 @@
 # ember-query
 
-Vectorized SQL query engine for lightweight analytical workloads on CSV and Parquet files (Rust).
+Small vectorized SQL query engine for lightweight analytical workloads on CSV files (Rust).
 
-CSV / Parquet ファイル向けの軽量分析ワークロード用ベクトル化 SQL クエリエンジン。
+CSV ファイル向けの軽量分析ワークロード用ベクトル化 SQL クエリエンジン。
 
-> 🟡 **Scaffold Phase** — 基本設計と MVP 実装準備中
+> 🟡 **In Development** — 基本機能は動作。API・設計は変更される可能性あり
 
 ## Status / ステータス
 
 | Item | State | 状態 |
 |------|------|------|
-| Phase / フェーズ | Scaffold | Scaffold |
-| MVP Start / 実装予定 | Q3 2026 | 2026-Q3 MVP開始 |
-| Tests / テスト | Not yet | 未実装 |
-| Docs / ドキュメント | Planned | 企画中 |
+| Phase / フェーズ | MVP in progress | MVP 実装中 |
+| Tests / テスト | Unit + E2E (`cargo test`) | 単体・E2E テストあり |
+| Parquet | Not supported (planned) | 未対応(計画中) |
+
+## Supported SQL / 対応する SQL
+
+- `SELECT` (`*`, 式, `AS` 別名) / `FROM <表> [別名]`
+- `WHERE` (`AND` `OR` `NOT`, `= <> != < <= > >=`, `+ - * /`)
+- `GROUP BY` + 集計 `COUNT` `SUM` `AVG` `MIN` `MAX`
+- `ORDER BY ... [ASC|DESC]`, `LIMIT n`
+- `[INNER] JOIN ... ON <式>` (INNER JOIN のみ。LEFT/OUTER は未対応)
+
+Limits / 制約:
+- Input is one CSV (schema inferred) / 入力は CSV 1 ファイル(スキーマは自動推定)
+- JOIN 先は `<表名>.csv` を入力 CSV と同じディレクトリから探す(無ければエラー)
+- JOIN で列名が重なると右側は `right_` 接頭辞になる(例: `right_name`)
+
+## Usage / 使い方
+
+```bash
+cargo run -- --input tests/fixtures/orders.csv \
+  --sql "SELECT region, COUNT(*), SUM(qty) FROM orders GROUP BY region"
+# region | agg_1 | agg_2
+# east   | 3     | 12
+# west   | 3     | 11
+
+cargo run -- --input tests/fixtures/t1.csv \
+  --sql "SELECT t1.v, right_name FROM t1 INNER JOIN t2 ON t1.id = t2.t1_id"
+```
+
+`--explain` prints the logical plan instead of running / 実行せず論理プランを表示。
+
+```bash
+cargo test   # unit + E2E tests / テスト実行
+```
 
 ## Tech Stack / 技術スタック
 
 - **Language / 言語:** Rust
 - **Build / ビルドツール:** Cargo
-- **Target formats / 対象形式:** CSV, Parquet
+- **Input format / 入力形式:** CSV (Parquet: planned / 計画中)
 
 ## Roadmap / 実装ロードマップ
 
 1. **Phase 1 (Q3 2026)** — SQL parser + scan layer / SQL パーサー + スキャン層
 2. **Phase 2 (Q4 2026)** — Vectorized execution engine + embedded index / ベクトル化実行エンジン + 組み込みインデックス
-3. **Phase 3 (Q1 2027)** — Query optimizer + aggregations / クエリオプティマイザ + 集計
+3. **Phase 3 (Q1 2027)** — Query optimizer + aggregations (aggregations done / 集計は実装済み) / クエリオプティマイザ + 集計
 4. **Phase 4 (Q2 2027)** — Benchmarking + docs / ベンチマーク + ドキュメント
-
-## Notes / 注意事項
-
-- **In Development / 開発中**: API/design may change without notice / API・設計は予告なく変更される可能性があります
-- **No tests yet / テスト未実装**: Quality not guaranteed until Phase 2 / 本格実装まで品質保証していません
 
 ---
 
-Track progress in [GitHub Issues](https://github.com/flipslidersand/ember-query/issues).
+Track progress in [GitHub Issues](https://github.com/flipslidersand-labs/ember-query/issues).
