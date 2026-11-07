@@ -11,11 +11,25 @@ use super::{evaluate, resolve_column, Executor};
 use crate::sql::ast::{AggFunc, Expr};
 
 /// A typed MIN/MAX candidate (keeps the input type, no f64 round trip).
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq)]
 enum Val {
     Int(i64),
     Float(f64),
     Str(String),
+}
+
+impl Val {
+    /// Total order for MIN/MAX. Floats use `f64::total_cmp` (same as ORDER BY),
+    /// so NaN no longer makes the result depend on row order (#94).
+    fn total_cmp(&self, other: &Val) -> std::cmp::Ordering {
+        match (self, other) {
+            (Val::Int(a), Val::Int(b)) => a.cmp(b),
+            (Val::Float(a), Val::Float(b)) => a.total_cmp(b),
+            (Val::Str(a), Val::Str(b)) => a.cmp(b),
+            // One column has one type, so mixed variants never occur.
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
 }
 
 /// Per-group accumulator state.
@@ -44,10 +58,10 @@ impl AggState {
     }
 
     fn update_minmax(&mut self, v: Val) {
-        if self.min.as_ref().is_none_or(|m| v < *m) {
+        if self.min.as_ref().is_none_or(|m| v.total_cmp(m).is_lt()) {
             self.min = Some(v.clone());
         }
-        if self.max.as_ref().is_none_or(|m| v > *m) {
+        if self.max.as_ref().is_none_or(|m| v.total_cmp(m).is_gt()) {
             self.max = Some(v);
         }
     }
@@ -879,5 +893,45 @@ mod tests {
         let v: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>, None]));
         let out = try_agg(vec![("v", v)], vec![(AggFunc::Max, col("v"), "x".into())]).unwrap();
         assert!(out.column(0).is_null(0));
+    }
+
+    // #94: MIN/MAX must not depend on row order when NaN is present
+    // (total order, same as ORDER BY: NaN is the largest value).
+    #[test]
+    fn float_min_max_with_nan_are_row_order_independent() {
+        let orders: Vec<Vec<f64>> = vec![
+            vec![f64::NAN, 1.5, 3.0],
+            vec![1.5, f64::NAN, 3.0],
+            vec![1.5, 3.0, f64::NAN],
+            vec![3.0, 1.5, f64::NAN],
+        ];
+        for vals in orders {
+            let v: ArrayRef = Arc::new(F64::from(vals.clone()));
+            let out = try_agg(
+                vec![("v", v)],
+                vec![
+                    (AggFunc::Min, col("v"), "mn".into()),
+                    (AggFunc::Max, col("v"), "mx".into()),
+                ],
+            )
+            .unwrap();
+            assert_eq!(f64s(&out, 0).value(0), 1.5, "min for {vals:?}");
+            assert!(f64s(&out, 1).value(0).is_nan(), "max for {vals:?}");
+        }
+    }
+
+    #[test]
+    fn float_min_max_all_nan_is_nan() {
+        let v: ArrayRef = Arc::new(F64::from(vec![f64::NAN, f64::NAN]));
+        let out = try_agg(
+            vec![("v", v)],
+            vec![
+                (AggFunc::Min, col("v"), "mn".into()),
+                (AggFunc::Max, col("v"), "mx".into()),
+            ],
+        )
+        .unwrap();
+        assert!(f64s(&out, 0).value(0).is_nan());
+        assert!(f64s(&out, 1).value(0).is_nan());
     }
 }
