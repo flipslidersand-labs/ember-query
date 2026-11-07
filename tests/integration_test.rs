@@ -354,3 +354,89 @@ fn test_deep_unary_minus_evaluates() -> Result<()> {
     );
     Ok(())
 }
+
+// ── #41: aggregate queries honour the SELECT list ────────────────────────────
+
+#[test]
+fn test_agg_select_order_follows_select_list() -> Result<()> {
+    let batches = run_query(
+        &fixture("orders.csv"),
+        "SELECT SUM(qty), region FROM orders GROUP BY region ORDER BY region",
+    )?;
+    // Aggregate emits (region, sum); the SELECT list asks for (sum, region).
+    assert_eq!(rows_of(&batches), strs(&[&["12", "east"], &["11", "west"]]));
+    Ok(())
+}
+
+#[test]
+fn test_agg_non_grouped_column_is_error() {
+    let res = run_query(
+        &fixture("orders.csv"),
+        "SELECT region, COUNT(*) FROM orders",
+    );
+    let err = res.expect_err("non-grouped column must be an error");
+    assert!(
+        err.to_string().contains("must appear in the GROUP BY"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_agg_compound_expression_is_unsupported_error() {
+    let res = run_query(&fixture("orders.csv"), "SELECT SUM(qty) + 1 FROM orders");
+    let err = res.expect_err("aggregate inside an expression must be an error");
+    assert!(err.to_string().contains("not supported"), "{err}");
+}
+
+#[test]
+fn test_agg_order_by_unselected_group_column_still_works() -> Result<()> {
+    // Excluding order 105 makes the groups differ in size (east 2, west 3),
+    // so ASC and DESC give different results.
+    let sql = |dir: &str| {
+        format!(
+            "SELECT COUNT(*) FROM orders WHERE order_id != 105 GROUP BY region ORDER BY region {dir}"
+        )
+    };
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &sql("DESC"))?),
+        strs(&[&["3"], &["2"]])
+    );
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), &sql("ASC"))?),
+        strs(&[&["2"], &["3"]])
+    );
+    Ok(())
+}
+
+#[test]
+fn test_agg_alias_colliding_with_group_column_is_error() {
+    let res = run_query(
+        &fixture("orders.csv"),
+        "SELECT COUNT(*) AS region, region FROM orders GROUP BY region",
+    );
+    let err = res.expect_err("duplicate aggregate output name must be an error");
+    assert!(err.to_string().contains("duplicate"), "{err}");
+}
+
+#[test]
+fn test_agg_alias_colliding_with_auto_name_is_error() {
+    let res = run_query(
+        &fixture("orders.csv"),
+        "SELECT COUNT(*) AS agg_1, SUM(qty) FROM orders",
+    );
+    let err = res.expect_err("duplicate aggregate output name must be an error");
+    assert!(err.to_string().contains("duplicate"), "{err}");
+}
+
+// -AGG(...) は #71 で Unary{Agg} になる。列が黙って消えず、#74 の
+// 「集約を式に埋め込めない」エラーになること。
+#[test]
+fn test_agg_under_unary_minus_is_unsupported_error() {
+    for sql in [
+        "SELECT region, -COUNT(*) FROM orders GROUP BY region",
+        "SELECT region, -SUM(qty) FROM orders GROUP BY region",
+    ] {
+        let err = run_query(&fixture("orders.csv"), sql).expect_err(sql);
+        assert!(err.to_string().contains("not supported"), "{sql}: {err}");
+    }
+}
