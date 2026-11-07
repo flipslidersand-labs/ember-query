@@ -137,6 +137,16 @@ fn check_qualifiers(stmt: &SelectStmt) -> Result<()> {
     let tables: Vec<&str> = std::iter::once(stmt.from.tag())
         .chain(stmt.joins.iter().map(|j| j.tag()))
         .collect();
+    // A repeated tag is an error once an alias is involved; an unaliased
+    // self-JOIN (`FROM t1 JOIN t1`) keeps working as on master.
+    let aliased = std::iter::once(stmt.from.alias.is_some())
+        .chain(stmt.joins.iter().map(|j| j.alias.is_some()))
+        .collect::<Vec<_>>();
+    for (i, t) in tables.iter().enumerate() {
+        if (0..i).any(|j| tables[j] == *t && (aliased[i] || aliased[j])) {
+            anyhow::bail!("duplicate table alias '{t}'");
+        }
+    }
     let mut cols: Vec<&String> = stmt.group_by.iter().collect();
     cols.extend(stmt.order_by.iter().map(|o| &o.column));
     let mut exprs: Vec<&Expr> = stmt
