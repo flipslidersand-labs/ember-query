@@ -86,6 +86,15 @@ fn test_project_arithmetic_expr_is_int64() -> Result<()> {
 }
 
 #[test]
+fn test_float_division_by_zero_is_error() {
+    let err = run_query(&sample_csv(), "SELECT price / 0.0 FROM data").unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("divide by zero"),
+        "{err}"
+    );
+}
+
+#[test]
 fn test_project_comparison_expr_is_boolean() -> Result<()> {
     use arrow::datatypes::DataType;
     assert_eq!(types_of("SELECT price > 1 FROM data")?, [DataType::Boolean]);
