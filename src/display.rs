@@ -1,6 +1,7 @@
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use unicode_width::UnicodeWidthStr;
 
 /// Pretty-print batches as one aligned ASCII table on stdout.
 pub fn print_batch(batches: &[RecordBatch]) {
@@ -9,7 +10,8 @@ pub fn print_batch(batches: &[RecordBatch]) {
 
 /// Render all batches as a single table: one header, widths decided over every row.
 /// Returns an empty string when there are no batches (no schema to print).
-/// Widths use `str::len` (bytes), so multi-byte text is not width-aligned.
+/// Widths are terminal display columns (`UnicodeWidthStr::width`): full-width
+/// characters count 2, combining marks 0.
 pub fn format_batch(batches: &[RecordBatch]) -> String {
     let Some(first) = batches.first() else {
         return String::new();
@@ -29,15 +31,15 @@ pub fn format_batch(batches: &[RecordBatch]) -> String {
 
     let col_widths: Vec<usize> = (0..n_cols)
         .map(|i| {
-            let max_val = col_data[i].iter().map(|s| s.len()).max().unwrap_or(0);
-            schema.field(i).name().len().max(max_val)
+            let max_val = col_data[i].iter().map(|s| s.width()).max().unwrap_or(0);
+            schema.field(i).name().width().max(max_val)
         })
         .collect();
 
     let pad_line = |cells: &mut dyn Iterator<Item = &str>| -> String {
         cells
             .zip(&col_widths)
-            .map(|(c, &w)| format!("{:<w$}", c))
+            .map(|(c, &w)| format!("{c}{}", " ".repeat(w.saturating_sub(c.width()))))
             .collect::<Vec<_>>()
             .join(" | ")
     };
@@ -152,12 +154,75 @@ mod tests {
         assert_eq!(format_batch(&[]), "");
     }
 
+    fn str_batch(name: &str, vals: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)]));
+        let col: ArrayRef = Arc::new(StringArray::from(vals));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
     #[test]
-    fn multibyte_width_uses_byte_len_current_behaviour() {
-        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
-        let col: ArrayRef = Arc::new(StringArray::from(vec!["日本"]));
-        let out = format_batch(&[RecordBatch::try_new(schema, vec![col]).unwrap()]);
-        // "日本" is 6 bytes: width follows bytes, not display columns.
-        assert_eq!(out.lines().nth(1).unwrap(), "------");
+    fn fullwidth_counts_two_columns_each() {
+        let out = format_batch(&[str_batch("s", vec![Some("日本")])]);
+        let lines: Vec<&str> = out.lines().collect();
+        // "日本" is 4 display columns (6 bytes, 2 chars).
+        assert_eq!(lines[0], "s   ");
+        assert_eq!(lines[1], "----");
+        assert_eq!(lines[2], "日本");
+    }
+
+    #[test]
+    fn mixed_fullwidth_and_ascii_rows_align() {
+        let out = format_batch(&[str_batch("name", vec![Some("日本語"), Some("abc"), None])]);
+        let lines: Vec<&str> = out.lines().collect();
+        // widest cell "日本語" = 6 columns.
+        assert_eq!(lines[0], "name  ");
+        assert_eq!(lines[1], "------");
+        assert_eq!(lines[2], "日本語");
+        assert_eq!(lines[3], "abc   ");
+        assert_eq!(lines[4], "NULL  ");
+    }
+
+    #[test]
+    fn fullwidth_header_and_multiple_columns_align() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("名前", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["a", "東京都"])),
+            Arc::new(Int64Array::from(vec![1, 2])),
+        ];
+        let out = format_batch(&[RecordBatch::try_new(schema, cols).unwrap()]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "名前   | n");
+        assert_eq!(lines[1], "-------+--");
+        assert_eq!(lines[2], "a      | 1");
+        assert_eq!(lines[3], "東京都 | 2");
+    }
+
+    #[test]
+    fn fullwidth_widths_decided_across_batches() {
+        let out = format_batch(&[
+            str_batch("s", vec![Some("a")]),
+            str_batch("s", vec![Some("日本")]),
+        ]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[1], "----");
+        assert_eq!(lines[2], "a   ");
+        assert_eq!(lines[3], "日本");
+    }
+
+    #[test]
+    fn combining_mark_is_zero_width_and_emoji_is_two() {
+        // "e" + U+0301 (combining acute) renders in 1 column; "😀" in 2.
+        let out = format_batch(&[str_batch(
+            "s",
+            vec![Some("e\u{301}"), Some("😀"), Some("ab")],
+        )]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[1], "--");
+        assert_eq!(lines[2], "e\u{301} ");
+        assert_eq!(lines[3], "😀");
+        assert_eq!(lines[4], "ab");
     }
 }

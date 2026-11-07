@@ -630,3 +630,15 @@ fn test_agg_under_unary_minus_is_unsupported_error() {
         assert!(err.to_string().contains("not supported"), "{sql}: {err}");
     }
 }
+
+#[test]
+fn test_table_alias_without_as() -> Result<()> {
+    let path = sample_csv();
+    let batches = run_query(&path, "SELECT * FROM data d WHERE price > 1000 LIMIT 3")?;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+    let batches = run_query(&path, "SELECT * FROM data LIMIT 1")?;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1);
+    Ok(())
+}
