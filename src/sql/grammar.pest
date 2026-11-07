@@ -65,9 +65,10 @@ aliased_expr = { expr ~ (KW_AS ~ ident)? }
 wildcard = { "*" }
 
 // FROM clause — table with optional alias
-table_ref = { table_name ~ (KW_AS ~ table_alias)? }
+// AS is optional; words that can follow a table_ref are never taken as an alias.
+table_ref = { table_name ~ (KW_AS? ~ table_alias)? }
 table_name  = @{ ident }
-table_alias = @{ ident }
+table_alias = @{ !(KW_AS | KW_ON | KW_INNER | KW_JOIN | KW_WHERE | KW_GROUP | KW_ORDER | KW_LIMIT) ~ ident }
 
 // JOIN clause (INNER JOIN only for Phase 5)
 join_clause = { (KW_INNER ~ KW_JOIN | KW_JOIN) ~ table_ref ~ KW_ON ~ expr }
