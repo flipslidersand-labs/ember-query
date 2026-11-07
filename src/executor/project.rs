@@ -41,12 +41,14 @@ impl ProjectExec {
             .map(|(name, expr)| {
                 let dt = infer_expr_type(expr, &in_schema);
                 let f = Field::new(name, dt, true);
-                // A plain column keeps its source tag so a Sort above can
+                // A plain, unaliased column keeps its source tag so a Sort above can
                 // still resolve `t.col` (e.g. `SELECT * ... ORDER BY t2.id`).
                 match expr {
                     Expr::Column(c) => match resolve_column(&in_schema, c) {
-                        Ok(i) => f.with_metadata(in_schema.field(i).metadata().clone()),
-                        Err(_) => f,
+                        Ok(i) if c == name || in_schema.field(i).name() == name => {
+                            f.with_metadata(in_schema.field(i).metadata().clone())
+                        }
+                        _ => f,
                     },
                     _ => f,
                 }
