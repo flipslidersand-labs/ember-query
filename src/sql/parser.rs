@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_literals_stay_literals() {
+    fn negative_literals_keep_their_sign() {
         assert_eq!(sel("-1"), Expr::Literal(Value::Int(-1)));
         assert_eq!(sel("-2.5"), Expr::Literal(Value::Float(-2.5)));
         assert_eq!(
