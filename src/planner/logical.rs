@@ -297,12 +297,21 @@ fn hidden_order_by(select: &[SelectItem], order_by: &[OrderByItem]) -> Option<Ve
         return None;
     }
     let out_name = |item: &SelectItem| match item {
-        SelectItem::Expr(_, Some(alias)) => Some(alias.clone()),
-        SelectItem::Expr(Expr::Column(c), None) => Some(c.clone()),
+        SelectItem::Expr(_, Some(alias)) => Some((alias.clone(), true)),
+        SelectItem::Expr(Expr::Column(c), None) => Some((c.clone(), false)),
         _ => None,
     };
-    let names: Vec<String> = select.iter().filter_map(out_name).collect();
-    let in_output = |col: &str| names.iter().any(|n| same_column(n, col));
+    let names: Vec<(String, bool)> = select.iter().filter_map(out_name).collect();
+    // An alias matches only its exact name: `t1.v` must not hit `... AS v`.
+    let in_output = |col: &str| {
+        names.iter().any(|(n, aliased)| {
+            if *aliased {
+                n == col
+            } else {
+                same_column(n, col)
+            }
+        })
+    };
     if order_by.iter().all(|o| in_output(&o.column)) {
         return None;
     }

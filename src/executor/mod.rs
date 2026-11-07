@@ -13,7 +13,7 @@ use anyhow::{anyhow, Result};
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute;
 use arrow::compute::kernels::numeric as numeric_kernels;
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -35,20 +35,81 @@ pub fn same_column(a: &str, b: &str) -> bool {
     a == b || (!a.contains('.') && a == bare(b)) || (!b.contains('.') && b == bare(a))
 }
 
-/// Resolve a (possibly qualified) column reference to a field index:
+/// Field metadata keys recording a column's source table and bare name. Set
+/// by the CSV scan; kept through JOIN renames (`right_<col>`) and plain
+/// column projections.
+pub const TABLE_KEY: &str = "table";
+pub const COLUMN_KEY: &str = "column";
+
+/// Tag `f` as column `column` of table `table`.
+pub fn tag_field(f: Field, table: &str, column: &str) -> Field {
+    f.with_metadata(std::collections::HashMap::from([
+        (TABLE_KEY.to_string(), table.to_string()),
+        (COLUMN_KEY.to_string(), column.to_string()),
+    ]))
+}
+
+fn field_tag(f: &Field) -> Option<(&str, &str)> {
+    let m = f.metadata();
+    Some((m.get(TABLE_KEY)?.as_str(), m.get(COLUMN_KEY)?.as_str()))
+}
+
+/// A reference naming `f` unambiguously: `table.column` when tagged.
+pub fn field_ref(f: &Field) -> String {
+    field_tag(f).map_or_else(|| f.name().clone(), |(t, c)| format!("{t}.{c}"))
+}
+
+/// Candidates by source-table tag. `t.col` on a schema tagged with table `t`
+/// matches only `t`'s `col`; a bare `col` matches every table's `col` plus an
+/// exact field name. `None` (tags cannot decide: untagged schema, unknown
+/// qualifier, or no tagged match for a bare name) falls back to name matching.
+fn tagged_hits(schema: &Schema, name: &str) -> Option<Vec<usize>> {
+    let tags: Vec<_> = schema.fields().iter().map(|f| field_tag(f)).collect();
+    let (table, col) = match name.rsplit_once('.') {
+        Some((t, c)) => (Some(t), c),
+        None => (None, name),
+    };
+    if table.is_some() && !tags.iter().flatten().any(|(t, _)| Some(*t) == table) {
+        return None;
+    }
+    let hits: Vec<usize> = (0..tags.len())
+        .filter(|&i| match tags[i] {
+            Some((t, c)) if c == col && table.is_none_or(|q| q == t) => true,
+            _ => table.is_none() && schema.field(i).name() == name,
+        })
+        .collect();
+    (table.is_some() || hits.iter().any(|&i| tags[i].is_some())).then_some(hits)
+}
+
+/// Resolve a (possibly qualified) column reference to a field index. Tagged
+/// schemas resolve by (table, column) first (see `tagged_hits`); otherwise
 /// exact name first, then a unique `same_column` match. Several matches
-/// are an error rather than a silent pick. A JOIN renames the right side's
-/// colliding columns to `right_<col>`, so a qualified `t.col` that also has a
+/// are an error rather than a silent pick. Without tags, a JOIN's
+/// `right_<col>` rename means a qualified `t.col` that also has a
 /// `right_col` could mean either table and is ambiguous too.
 pub fn resolve_column(schema: &Schema, name: &str) -> Result<usize> {
-    if let Ok(i) = schema.index_of(name) {
-        return Ok(i);
-    }
     let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
-    let mut hits: Vec<usize> = (0..names.len())
-        .filter(|&i| same_column(names[i], name))
-        .collect();
-    if let (false, Some((_, bare))) = (hits.is_empty(), name.rsplit_once('.')) {
+    let tagged = tagged_hits(schema, name);
+    if tagged.is_none() {
+        if let Ok(i) = schema.index_of(name) {
+            return Ok(i);
+        }
+    }
+    let mut hits: Vec<usize> = tagged.clone().unwrap_or_else(|| {
+        (0..names.len())
+            .filter(|&i| same_column(names[i], name))
+            .collect()
+    });
+    // Repeating the same output column (`SELECT qty, qty`) is not ambiguous.
+    if hits.len() > 1
+        && hits
+            .iter()
+            .all(|&i| schema.field(i) == schema.field(hits[0]))
+    {
+        hits.truncate(1);
+    }
+    let untagged_hit = tagged.is_none() && !hits.is_empty();
+    if let (true, Some((_, bare))) = (untagged_hit, name.rsplit_once('.')) {
         hits.extend(schema.index_of(&format!("right_{bare}")).ok());
     }
     match hits.as_slice() {
@@ -838,15 +899,30 @@ mod resolve_column_tests {
     }
 
     #[test]
-    fn qualified_name_colliding_with_join_rename_is_ambiguous() {
-        let s = schema(&["id", "name", "right_id", "t1_id"]);
-        let err = resolve_column(&s, "t2.id").unwrap_err().to_string();
-        assert!(err.contains("ambiguous"), "{err}");
-        // Exact and unqualified names keep resolving as before.
-        assert_eq!(resolve_column(&s, "id").unwrap(), 0);
+    fn qualified_name_colliding_with_join_rename_resolves_by_table_tag() {
+        let f = |n: &str, t: &str, c: &str| {
+            super::tag_field(Field::new(n, DataType::Int64, true), t, c)
+        };
+        let s = Schema::new(vec![
+            f("id", "t1", "id"),
+            f("name", "t1", "name"),
+            f("right_id", "t2", "id"),
+            f("t1_id", "t2", "t1_id"),
+        ]);
+        assert_eq!(resolve_column(&s, "t2.id").unwrap(), 2);
+        assert_eq!(resolve_column(&s, "t1.id").unwrap(), 0);
         assert_eq!(resolve_column(&s, "right_id").unwrap(), 2);
-        assert_eq!(resolve_column(&s, "t2.name").unwrap(), 1);
         assert_eq!(resolve_column(&s, "t2.t1_id").unwrap(), 3);
+        assert_eq!(resolve_column(&s, "t1_id").unwrap(), 3);
+        let err = resolve_column(&s, "id").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        // A known table lacking the column never falls back to another table's.
+        let err = resolve_column(&s, "t2.name").unwrap_err().to_string();
+        assert!(err.contains("not found"), "{err}");
+        // Untagged schemas keep the conservative fallback.
+        let untagged = schema(&["id", "right_id"]);
+        let err = resolve_column(&untagged, "t2.id").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
         // A lone `right_x` column is not a fallback target for `t.x`.
         let lone = schema(&["right_x"]);
         assert!(resolve_column(&lone, "t.x").is_err());
