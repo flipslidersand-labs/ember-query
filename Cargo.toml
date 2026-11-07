@@ -2,7 +2,8 @@
 name = "ember-query"
 version = "0.1.0"
 edition = "2021"
-description = "A small vectorized SQL engine for CSV/Parquet files"
+description = "A small vectorized SQL engine for CSV files"
+license = "MIT"
 
 [[bin]]
 name = "ember-query"
