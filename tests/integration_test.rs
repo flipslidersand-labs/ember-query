@@ -324,3 +324,75 @@ fn test_agg_alias_colliding_with_auto_name_is_error() {
     let err = res.expect_err("duplicate aggregate output name must be an error");
     assert!(err.to_string().contains("duplicate"), "{err}");
 }
+
+// #39: qualified column names (`table.col`) resolve against a single table.
+
+#[test]
+fn test_qualified_columns_in_select_and_where() -> Result<()> {
+    let all = run_query(
+        &fixture("orders.csv"),
+        "SELECT orders.order_id FROM orders WHERE orders.qty > 1",
+    )?;
+    assert_eq!(
+        rows_of(&all),
+        strs(&[&["101"], &["102"], &["103"], &["104"], &["105"], &["106"]])
+    );
+    let some = run_query(
+        &fixture("orders.csv"),
+        "SELECT orders.order_id FROM orders WHERE orders.qty > 3",
+    )?;
+    assert_eq!(rows_of(&some), strs(&[&["102"], &["104"], &["106"]]));
+    Ok(())
+}
+
+#[test]
+fn test_qualified_group_by_and_aggregate_argument() -> Result<()> {
+    let batches = run_query(
+        &fixture("orders.csv"),
+        "SELECT orders.region, SUM(orders.qty) FROM orders GROUP BY orders.region ORDER BY orders.region",
+    )?;
+    assert_eq!(rows_of(&batches), strs(&[&["east", "12"], &["west", "11"]]));
+    Ok(())
+}
+
+#[test]
+fn test_qualified_and_unqualified_group_columns_match() -> Result<()> {
+    let expected = strs(&[&["east", "12"], &["west", "11"]]);
+    for sql in [
+        "SELECT orders.region, SUM(qty) FROM orders GROUP BY region ORDER BY region",
+        "SELECT region, SUM(qty) FROM orders GROUP BY orders.region ORDER BY region",
+    ] {
+        assert_eq!(
+            rows_of(&run_query(&fixture("orders.csv"), sql)?),
+            expected,
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_qualified_order_by() -> Result<()> {
+    let cases: [(&str, &[&[&str]]); 3] = [
+        (
+            "SELECT orders.order_id FROM orders ORDER BY orders.qty DESC LIMIT 3",
+            &[&["104"], &["102"], &["106"]],
+        ),
+        (
+            "SELECT order_id FROM orders ORDER BY orders.order_id DESC LIMIT 2",
+            &[&["106"], &["105"]],
+        ),
+        (
+            "SELECT orders.order_id FROM orders ORDER BY order_id DESC LIMIT 2",
+            &[&["106"], &["105"]],
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(
+            rows_of(&run_query(&fixture("orders.csv"), sql)?),
+            strs(expected),
+            "{sql}"
+        );
+    }
+    Ok(())
+}
