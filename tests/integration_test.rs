@@ -396,3 +396,29 @@ fn test_qualified_order_by() -> Result<()> {
     }
     Ok(())
 }
+
+/// After a JOIN whose tables share column names, the right side's columns
+/// are renamed `right_<col>`. A qualified `t2.col` must not silently resolve
+/// to the left table's `col` (#39 review / #40): it is an error instead.
+#[test]
+fn test_join_name_collision_qualified_right_column_is_error() {
+    for sql in [
+        "SELECT t2.id, t2.name FROM t1 JOIN t2 ON t1.id = t2.t1_id",
+        "SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t2.id = 300",
+        "SELECT t2.name, COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.t1_id GROUP BY t2.name",
+    ] {
+        let res = run_query_with_catalog(&fixture("t1.csv"), sql);
+        let err = res.expect_err(sql).to_string();
+        assert!(err.contains("ambiguous"), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn test_join_qualified_unique_columns_still_resolve() -> Result<()> {
+    let batches = run_query_with_catalog(
+        &fixture("t1.csv"),
+        "SELECT t1.v, t2.t1_id FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.v > 10",
+    )?;
+    assert_eq!(rows_of(&batches), strs(&[&["20", "2"]]));
+    Ok(())
+}
