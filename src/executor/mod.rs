@@ -100,6 +100,14 @@ pub fn resolve_column(schema: &Schema, name: &str) -> Result<usize> {
             .filter(|&i| same_column(names[i], name))
             .collect()
     });
+    // Repeating the same output column (`SELECT qty, qty`) is not ambiguous.
+    if hits.len() > 1
+        && hits
+            .iter()
+            .all(|&i| schema.field(i) == schema.field(hits[0]))
+    {
+        hits.truncate(1);
+    }
     let untagged_hit = tagged.is_none() && !hits.is_empty();
     if let (true, Some((_, bare))) = (untagged_hit, name.rsplit_once('.')) {
         hits.extend(schema.index_of(&format!("right_{bare}")).ok());

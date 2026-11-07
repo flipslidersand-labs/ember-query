@@ -567,10 +567,6 @@ fn test_join_name_collision_qualified_right_column_resolves() -> Result<()> {
         ),
         (format!("SELECT t1.name {j} WHERE t2.id = 1"), vec![]),
         (
-            format!("SELECT t1.name {j} ORDER BY t2.id DESC"),
-            vec![vec!["b"], vec!["a"]],
-        ),
-        (
             format!("SELECT t2.name, COUNT(*) {j} GROUP BY t2.name ORDER BY t2.name"),
             vec![vec!["x", "1"], vec!["y", "1"]],
         ),
@@ -670,6 +666,77 @@ fn test_join_qualified_unique_columns_still_resolve() -> Result<()> {
         "SELECT t1.v, t2.t1_id FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.v > 10",
     )?;
     assert_eq!(rows_of(&batches), strs(&[&["20", "2"]]));
+    Ok(())
+}
+
+/// A qualified ORDER BY key must not be captured by an output alias of the
+/// same bare name, and t2.id must sort differently from t1.id (#91 review).
+#[test]
+fn test_join_qualified_order_by_not_captured_by_alias() -> Result<()> {
+    let files = [
+        ("t1", "id,name,v\n1,a,20\n2,b,10\n3,c,30\n"),
+        ("t2", "id,t1_id,name\n300,1,x\n100,2,z\n200,3,y\n"),
+    ];
+    let j = "FROM t1 JOIN t2 ON t1.id = t2.t1_id";
+    for (tag, sql, expected) in [
+        (
+            "alias_v",
+            format!("SELECT t2.name AS v {j} ORDER BY t1.v DESC"),
+            vec![vec!["y"], vec!["x"], vec!["z"]],
+        ),
+        (
+            "alias_id",
+            format!("SELECT t1.v AS id {j} ORDER BY t2.id DESC"),
+            vec![vec!["20"], vec!["30"], vec!["10"]],
+        ),
+        (
+            "right_id",
+            format!("SELECT t1.name {j} ORDER BY t2.id DESC"),
+            vec![vec!["a"], vec!["c"], vec!["b"]],
+        ),
+    ] {
+        let rows = rows_of(&run_query_in_dir(tag, &files, &sql)?);
+        assert_eq!(rows, expected, "{sql}");
+    }
+    Ok(())
+}
+
+/// An alias beside its source column, or a repeated column, is not
+/// ambiguous on a single table (same results as before #40).
+#[test]
+fn test_alias_beside_source_column_order_by_still_works() -> Result<()> {
+    let ew = |a: usize| -> Vec<Vec<&str>> {
+        ["east", "east", "east", "west", "west", "west"]
+            .iter()
+            .map(|r| vec![*r; a])
+            .collect()
+    };
+    for sql in [
+        "SELECT region AS r, region FROM orders ORDER BY region",
+        "SELECT region, region AS r FROM orders ORDER BY region",
+    ] {
+        assert_eq!(
+            rows_of(&run_query(&fixture("orders.csv"), sql)?),
+            ew(2),
+            "{sql}"
+        );
+    }
+    let sql = "SELECT qty, qty FROM orders ORDER BY qty";
+    let qty: Vec<Vec<&str>> = ["2", "2", "3", "4", "5", "7"]
+        .iter()
+        .map(|q| vec![*q, *q])
+        .collect();
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), sql)?),
+        qty,
+        "{sql}"
+    );
+    let sql = "SELECT qty AS region, region AS qty FROM orders ORDER BY qty";
+    let col1: Vec<String> = rows_of(&run_query(&fixture("orders.csv"), sql)?)
+        .into_iter()
+        .map(|r| r[1].clone())
+        .collect();
+    assert_eq!(col1, ew(1).concat(), "{sql}");
     Ok(())
 }
 
