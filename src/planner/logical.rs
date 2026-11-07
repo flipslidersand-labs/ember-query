@@ -8,7 +8,12 @@ use crate::sql::ast::{AggFunc, Expr, OrderByItem, SelectItem, SelectStmt};
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
     /// Table scan — reads the CSV at `path` with the given schema.
-    Scan { path: String, schema: TableSchema },
+    /// `table` (FROM alias or name) tags the columns for `table.col` (#92).
+    Scan {
+        path: String,
+        schema: TableSchema,
+        table: String,
+    },
     /// Filter rows by a predicate expression.
     Filter {
         input: Box<LogicalPlan>,
@@ -33,6 +38,8 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right_path: String,
         right_schema: TableSchema,
+        /// JOIN alias or table name tagging the right columns (#92).
+        right_table: String,
         on: Expr,
     },
     /// Sort output rows by one or more columns.
@@ -46,7 +53,7 @@ impl LogicalPlan {
     pub fn explain(&self, depth: usize) -> String {
         let indent = "  ".repeat(depth);
         match self {
-            LogicalPlan::Scan { path, schema } => {
+            LogicalPlan::Scan { path, schema, .. } => {
                 format!(
                     "{}Scan [{}] columns=[{}]",
                     indent,
@@ -124,6 +131,42 @@ impl LogicalPlan {
     }
 }
 
+/// Every qualified `q.col` (SELECT, WHERE, GROUP BY, ORDER BY, ON) must name a
+/// FROM/JOIN table by its alias, or its name when unaliased (#86).
+fn check_qualifiers(stmt: &SelectStmt) -> Result<()> {
+    let tables: Vec<&str> = std::iter::once(stmt.from.tag())
+        .chain(stmt.joins.iter().map(|j| j.tag()))
+        .collect();
+    let mut cols: Vec<&String> = stmt.group_by.iter().collect();
+    cols.extend(stmt.order_by.iter().map(|o| &o.column));
+    let mut exprs: Vec<&Expr> = stmt
+        .select
+        .iter()
+        .filter_map(|i| match i {
+            SelectItem::Expr(e, _) => Some(e),
+            SelectItem::Wildcard => None,
+        })
+        .collect();
+    exprs.extend(stmt.where_.iter());
+    exprs.extend(stmt.joins.iter().map(|j| &j.on));
+    while let Some(e) = exprs.pop() {
+        match e {
+            Expr::Column(c) => cols.push(c),
+            Expr::BinOp { left, right, .. } => exprs.extend([&**left, &**right]),
+            Expr::Unary { expr, .. } | Expr::Agg { expr, .. } => exprs.push(expr),
+            Expr::Literal(_) | Expr::Wildcard => {}
+        }
+    }
+    for c in cols {
+        if let Some((q, _)) = c.rsplit_once('.') {
+            if !tables.contains(&q) {
+                anyhow::bail!("unknown table qualifier '{q}' in '{c}' (tables: {tables:?})");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build a logical plan from a parsed `SelectStmt`.
 /// catalog maps table_name → (csv_path, schema).
 pub fn build(
@@ -132,10 +175,13 @@ pub fn build(
     schema: TableSchema,
     catalog: &std::collections::HashMap<String, (String, TableSchema)>,
 ) -> Result<LogicalPlan> {
+    check_qualifiers(stmt)?;
+
     // 1. Scan primary table
     let mut plan = LogicalPlan::Scan {
         path: path.to_string(),
         schema,
+        table: stmt.from.tag().to_string(),
     };
 
     // 2. JOINs (before filter so ON predicate can reference both sides)
@@ -148,6 +194,7 @@ pub fn build(
             left: Box::new(plan),
             right_path,
             right_schema,
+            right_table: join.tag().to_string(),
             on: join.on.clone(),
         };
     }
