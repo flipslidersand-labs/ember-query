@@ -121,6 +121,22 @@ fn test_where_or_null_keeps_true_rows() -> Result<()> {
 }
 
 #[test]
+fn test_where_null_predicates_return_no_rows() -> Result<()> {
+    for pred in ["NULL", "NOT NULL", "NULL AND TRUE"] {
+        let sql = format!("SELECT name FROM data WHERE {pred}");
+        let batches = run_query(&sample_csv(), &sql)?;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 0, "{pred}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_where_non_null_non_boolean_still_errors() {
+    assert!(run_query(&sample_csv(), "SELECT name FROM data WHERE 1").is_err());
+}
+
+#[test]
 fn test_project_not_null_is_boolean_null() -> Result<()> {
     use arrow::datatypes::DataType;
     let batches = run_query(&sample_csv(), "SELECT NOT NULL FROM data")?;
