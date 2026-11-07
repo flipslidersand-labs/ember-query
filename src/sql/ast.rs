@@ -77,11 +77,33 @@ pub enum SelectItem {
     Expr(Expr, Option<String>),
 }
 
+/// The FROM table with its optional alias.
+#[derive(Debug, Clone)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+impl TableRef {
+    /// What columns are qualified with: the alias, else the table name.
+    pub fn tag(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
 /// An INNER JOIN clause.
 #[derive(Debug, Clone)]
 pub struct JoinClause {
     pub table: String,
+    pub alias: Option<String>,
     pub on: Expr,
+}
+
+impl JoinClause {
+    /// What columns are qualified with: the alias, else the table name.
+    pub fn tag(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.table)
+    }
 }
 
 /// One item in an ORDER BY clause.
@@ -95,6 +117,7 @@ pub struct OrderByItem {
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
     pub select: Vec<SelectItem>,
+    pub from: TableRef,
     pub joins: Vec<JoinClause>,
     pub where_: Option<Expr>,
     pub group_by: Vec<String>,
