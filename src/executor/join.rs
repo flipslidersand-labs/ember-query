@@ -162,19 +162,9 @@ fn column_name(expr: &Expr) -> Option<String> {
     }
 }
 
-/// Evaluate a column (possibly qualified like "t1.col") and return as StringArray for hashing.
+/// Evaluate a join key column (possibly qualified like "t1.col").
 fn eval_column_str(batch: &RecordBatch, col: &str) -> Result<ArrayRef> {
-    // Try exact name first, then try unqualified suffix
-    if let Ok(arr) = evaluate(batch, &Expr::Column(col.to_string())) {
-        return Ok(arr);
-    }
-    // Try stripping the table prefix (e.g., "orders.id" → "id")
-    if let Some(unqualified) = col.split('.').next_back() {
-        if let Ok(arr) = evaluate(batch, &Expr::Column(unqualified.to_string())) {
-            return Ok(arr);
-        }
-    }
-    Err(anyhow!("column '{}' not found in batch", col))
+    evaluate(batch, &Expr::Column(col.to_string()))
 }
 
 /// Typed join key: values of different types never compare equal.

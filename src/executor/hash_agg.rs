@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{evaluate, Executor};
+use super::{evaluate, resolve_column, Executor};
 use crate::sql::ast::{AggFunc, Expr};
 
 /// A typed MIN/MAX candidate (keeps the input type, no f64 round trip).
@@ -95,10 +95,9 @@ impl HashAggExec {
         // Build output schema: group_by columns + agg output columns
         let mut fields = Vec::new();
         for col in &group_by {
-            let f = in_schema
-                .field_with_name(col)
-                .map_err(|_| anyhow!("GROUP BY column '{}' not found", col))?;
-            fields.push(f.clone());
+            let i = resolve_column(&in_schema, col)
+                .map_err(|e| anyhow!("GROUP BY column '{}': {}", col, e))?;
+            fields.push(in_schema.field(i).clone());
         }
         let empty = RecordBatch::new_empty(in_schema.clone());
         for (func, expr, name) in &aggs {
@@ -139,11 +138,9 @@ impl HashAggExec {
                 .group_by
                 .iter()
                 .map(|col| {
-                    batch
-                        .schema()
-                        .index_of(col)
+                    resolve_column(&batch.schema(), col)
                         .map(|i| batch.column(i).clone())
-                        .map_err(|_| anyhow!("GROUP BY column '{}' not found", col))
+                        .map_err(|e| anyhow!("GROUP BY column '{}': {}", col, e))
                 })
                 .collect::<Result<_>>()?;
 
@@ -195,8 +192,9 @@ impl HashAggExec {
         let mut columns: Vec<ArrayRef> = Vec::new();
 
         // Group-by columns
-        for (col_idx, col_name) in self.group_by.iter().enumerate() {
-            let field = self.out_schema.field_with_name(col_name)?;
+        // The first `group_by.len()` output fields are the group columns, in order.
+        for col_idx in 0..self.group_by.len() {
+            let field = self.out_schema.field(col_idx);
             let arr = build_group_column(field.data_type(), &key_order, col_idx, n_rows)?;
             columns.push(arr);
         }

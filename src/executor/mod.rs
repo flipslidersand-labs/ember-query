@@ -13,7 +13,7 @@ use anyhow::{anyhow, Result};
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute;
 use arrow::compute::kernels::numeric as numeric_kernels;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -25,27 +25,46 @@ pub trait Executor {
     fn schema(&self) -> SchemaRef;
 }
 
+// ── Column resolution ─────────────────────────────────────────────────────────
+
+/// Whether two column references name the same column: equal, or one is
+/// unqualified and equals the other's last segment (`t.col` ~ `col`).
+/// `t1.col` and `t2.col` are different columns.
+pub fn same_column(a: &str, b: &str) -> bool {
+    let bare = |s: &str| s.rsplit('.').next().unwrap_or(s).to_string();
+    a == b || (!a.contains('.') && a == bare(b)) || (!b.contains('.') && b == bare(a))
+}
+
+/// Resolve a (possibly qualified) column reference to a field index:
+/// exact name first, then a unique `same_column` match. Several matches
+/// are an error rather than a silent pick.
+pub fn resolve_column(schema: &Schema, name: &str) -> Result<usize> {
+    if let Ok(i) = schema.index_of(name) {
+        return Ok(i);
+    }
+    let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
+    let hits: Vec<usize> = (0..names.len())
+        .filter(|&i| same_column(names[i], name))
+        .collect();
+    match hits.as_slice() {
+        [i] => Ok(*i),
+        [] => Err(anyhow!("column '{}' not found in schema {:?}", name, names)),
+        _ => Err(anyhow!(
+            "column '{}' is ambiguous: matches {:?}",
+            name,
+            hits.iter().map(|&i| names[i]).collect::<Vec<_>>()
+        )),
+    }
+}
+
 // ── Expression evaluation ─────────────────────────────────────────────────────
 
 /// Evaluate an expression over a `RecordBatch`, returning an `ArrayRef`.
 pub fn evaluate(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
     match expr {
-        Expr::Column(name) => batch
-            .schema()
-            .index_of(name)
-            .map(|i| batch.column(i).clone())
-            .map_err(|_| {
-                anyhow!(
-                    "column '{}' not found in schema {:?}",
-                    name,
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| f.name())
-                        .collect::<Vec<_>>()
-                )
-            }),
+        Expr::Column(name) => {
+            resolve_column(&batch.schema(), name).map(|i| batch.column(i).clone())
+        }
 
         Expr::Literal(val) => make_scalar_array(val, batch.num_rows()),
 
@@ -666,5 +685,48 @@ mod eval_semantics_tests {
             err.to_string().contains("did not evaluate to boolean"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod resolve_column_tests {
+    use super::{resolve_column, same_column};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn schema(names: &[&str]) -> Schema {
+        Schema::new(
+            names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn same_column_matches_qualifier_against_bare_only() {
+        assert!(same_column("id", "id"));
+        assert!(same_column("t.id", "id"));
+        assert!(same_column("id", "t.id"));
+        assert!(!same_column("t1.id", "t2.id"));
+        assert!(!same_column("right_id", "t.id"));
+    }
+
+    #[test]
+    fn resolves_exact_then_last_segment() {
+        let s = schema(&["id", "t.qty"]);
+        assert_eq!(resolve_column(&s, "id").unwrap(), 0);
+        assert_eq!(resolve_column(&s, "orders.id").unwrap(), 0);
+        assert_eq!(resolve_column(&s, "qty").unwrap(), 1);
+        assert_eq!(resolve_column(&s, "t.qty").unwrap(), 1);
+        let err = resolve_column(&s, "orders.nope").unwrap_err().to_string();
+        assert!(err.contains("column 'orders.nope' not found"), "{err}");
+    }
+
+    #[test]
+    fn ambiguous_match_is_an_error() {
+        let s = schema(&["a.id", "b.id"]);
+        let err = resolve_column(&s, "id").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert_eq!(resolve_column(&s, "b.id").unwrap(), 1);
     }
 }
