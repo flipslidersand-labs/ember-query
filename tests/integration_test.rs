@@ -811,6 +811,170 @@ fn test_table_alias_without_as() -> Result<()> {
     Ok(())
 }
 
+// #92: table aliases and the FROM name tag the columns; #86: unknown qualifiers fail.
+
+const Q92_T1: &str = "id,name,v\n1,a,10\n2,b,20\n";
+/// t2.id runs opposite to t1.id, so picking the wrong table's `id` shows.
+const Q92_T2: &str = "id,t1_id,name\n2,1,x\n1,2,y\n";
+
+#[test]
+fn test_q92_alias_qualified_column_picks_aliased_table() -> Result<()> {
+    let rows = rows_of(&run_query_in_dir(
+        "alias",
+        &[("t1", Q92_T1), ("t2", Q92_T2)],
+        "SELECT a.id, b.id, b.name, a.name FROM t1 AS a JOIN t2 AS b ON a.id = b.t1_id ORDER BY b.id",
+    )?);
+    assert_eq!(rows, strs(&[&["2", "1", "y", "b"], &["1", "2", "x", "a"]]));
+    let rows = rows_of(&run_query_with_catalog(
+        &fixture("t1.csv"),
+        "SELECT b.name FROM t1 a JOIN t2 b ON a.id = b.t1_id ORDER BY a.id",
+    )?);
+    assert_eq!(rows, strs(&[&["x"], &["y"]]));
+    // t2 has no `v`: `b.v` must not fall back to t1's `v`.
+    let err = run_query_with_catalog(
+        &fixture("t1.csv"),
+        "SELECT b.v FROM t1 AS a JOIN t2 AS b ON a.id = b.t1_id",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not found"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn test_q92_input_file_name_differs_from_from_name() -> Result<()> {
+    let rows = rows_of(&run_query_in_dir(
+        "stem",
+        &[("t1.v2", Q92_T1), ("t2", Q92_T2)],
+        "SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.id = t2.t1_id ORDER BY t2.id",
+    )?);
+    assert_eq!(rows, strs(&[&["2", "1"], &["1", "2"]]));
+    Ok(())
+}
+
+#[test]
+fn test_q92_self_join_distinguished_by_alias() -> Result<()> {
+    // a.v points at b.id: row 1 joins row 2 and vice versa.
+    let rows = rows_of(&run_query_in_dir(
+        "self",
+        &[("t1", "id,name,v\n1,a,2\n2,b,1\n")],
+        "SELECT a.id, b.id, b.name FROM t1 a JOIN t1 b ON a.v = b.id ORDER BY a.id",
+    )?);
+    assert_eq!(rows, strs(&[&["1", "2", "b"], &["2", "1", "a"]]));
+    Ok(())
+}
+
+#[test]
+fn test_q92_self_join_select_star_succeeds() -> Result<()> {
+    for sql in [
+        "SELECT * FROM t1 JOIN t1 ON t1.id = t1.id",
+        "SELECT * FROM t1 a JOIN t1 b ON a.id = b.id",
+    ] {
+        let rows = rows_of(&run_query_with_catalog(&fixture("t1.csv"), sql)?);
+        assert_eq!(
+            rows,
+            strs(&[
+                &["1", "a", "10", "1", "a", "10"],
+                &["2", "b", "20", "2", "b", "20"]
+            ]),
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_q86_unknown_qualifier_is_error_in_every_clause() {
+    for sql in [
+        "SELECT x.name FROM t1",
+        "SELECT x.name FROM t1 WHERE x.v > 10",
+        "SELECT name FROM t1 WHERE x.v > 10",
+        "SELECT name FROM t1 ORDER BY x.v",
+        "SELECT COUNT(*) FROM t1 GROUP BY x.name",
+        "SELECT SUM(x.v) FROM t1",
+        "SELECT t1.name FROM t1 JOIN t2 ON t1.id = x.t1_id",
+    ] {
+        let err = run_query_with_catalog(&fixture("t1.csv"), sql)
+            .err()
+            .unwrap_or_else(|| panic!("expected error: {sql}"))
+            .to_string();
+        assert!(err.contains("unknown table qualifier 'x'"), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn test_q86_alias_hides_original_table_name() -> Result<()> {
+    for sql in [
+        "SELECT t1.v FROM t1 a",
+        "SELECT a.v FROM t1 a WHERE t1.v > 10",
+        "SELECT a.name FROM t1 a JOIN t2 b ON t1.id = b.t1_id",
+        "SELECT a.name FROM t1 a JOIN t2 b ON a.id = b.t1_id ORDER BY t2.id",
+    ] {
+        let err = run_query_with_catalog(&fixture("t1.csv"), sql)
+            .err()
+            .unwrap_or_else(|| panic!("expected error: {sql}"))
+            .to_string();
+        assert!(err.contains("unknown table qualifier"), "{sql}: {err}");
+    }
+    let rows = rows_of(&run_query_with_catalog(
+        &fixture("t1.csv"),
+        "SELECT a.v FROM t1 a WHERE a.v > 10",
+    )?);
+    assert_eq!(rows, strs(&[&["20"]]));
+    Ok(())
+}
+
+/// Asymmetric self-JOIN data: 1→2, 2→3, 3→1, so swapped ON sides show.
+const Q92_S: &str = "id,v\n1,2\n2,3\n3,1\n";
+
+#[test]
+fn test_q92_join_on_operand_order_does_not_matter() -> Result<()> {
+    for on in ["a.v = b.id", "b.id = a.v"] {
+        let sql = format!("SELECT a.id, b.id FROM s a JOIN s b ON {on} ORDER BY a.id");
+        let rows = rows_of(&run_query_in_dir("onorder", &[("s", Q92_S)], &sql)?);
+        assert_eq!(
+            rows,
+            strs(&[&["1", "2"], &["2", "3"], &["3", "1"]]),
+            "{sql}"
+        );
+    }
+    let rows = rows_of(&run_query_with_catalog(
+        &fixture("t1.csv"),
+        "SELECT a.name, b.name FROM t1 a JOIN t2 b ON b.t1_id = a.id ORDER BY a.id",
+    )?);
+    assert_eq!(rows, strs(&[&["a", "x"], &["b", "y"]]));
+    Ok(())
+}
+
+#[test]
+fn test_q92_join_on_columns_of_one_side_is_error() {
+    let err = run_query_in_dir(
+        "oneside",
+        &[("s", Q92_S)],
+        "SELECT a.id FROM s a JOIN s b ON a.id = a.v",
+    )
+    .expect_err("ON comparing one side must fail")
+    .to_string();
+    assert!(err.contains("JOIN ON"), "{err}");
+}
+
+#[test]
+fn test_q86_duplicate_table_alias_is_error() {
+    for sql in [
+        "SELECT a.id FROM t1 a JOIN t2 a ON a.id = a.t1_id",
+        "SELECT t1.id FROM t1 JOIN t2 t1 ON t1.id = t1.t1_id",
+    ] {
+        let err = run_query_with_catalog(&fixture("t1.csv"), sql)
+            .err()
+            .unwrap_or_else(|| panic!("expected error: {sql}"))
+            .to_string();
+        assert!(err.contains("duplicate table alias"), "{sql}: {err}");
+    }
+    // An unaliased self-JOIN keeps working as on master.
+    let sql = "SELECT * FROM t1 JOIN t1 ON t1.id = t1.id";
+    assert!(run_query_with_catalog(&fixture("t1.csv"), sql).is_ok());
+}
+
 // #94: NaN を含む Float 列の MIN/MAX は行順に依存しない(ORDER BY と同じ全順序)。
 #[test]
 fn test_min_max_nan_is_row_order_independent() -> Result<()> {
