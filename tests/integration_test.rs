@@ -811,6 +811,35 @@ fn test_table_alias_without_as() -> Result<()> {
     Ok(())
 }
 
+// #95: 先頭 100 行が整数で 101 行目が N/A の列は、全行推論で Utf8 になる。
+// CSV 読み取り時の "cannot parse 'N/A' as i64" は起きず、文字列として照会できる。
+// (Utf8 列と整数リテラルの比較は別問題で、現状は比較演算の型エラーになる。)
+#[test]
+fn test_type_mismatch_after_row_100_does_not_fail_at_runtime() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ember_query_it95_{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("samp.csv");
+    let mut s = String::from("n\n");
+    for i in 0..100 {
+        s.push_str(&format!("{}\n", i));
+    }
+    s.push_str("N/A\n");
+    std::fs::write(&path, s)?;
+    let p = path.to_str().unwrap();
+    let result = run_query(p, "SELECT n FROM samp WHERE n = '5'");
+    let issue_query = run_query(p, "SELECT n FROM samp WHERE n = 5");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let total: usize = result?.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1);
+    // Utf8 列と整数リテラルの比較は型エラー(本 Issue の範囲外)。CSV 読み取りの parse エラーではない。
+    let e = issue_query.expect_err("Utf8 == Int64 is currently a type error");
+    let msg = e.to_string();
+    assert!(!msg.contains("cannot parse"), "got: {msg}");
+    assert!(msg.contains("Utf8") && msg.contains("Int64"), "got: {msg}");
+    Ok(())
+}
+
 // #96: 日本語ヘッダの CSV を列名・表名として参照できる
 #[test]
 fn test_unicode_identifiers_select_where_order_group() -> Result<()> {
