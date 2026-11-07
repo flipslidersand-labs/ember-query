@@ -923,3 +923,54 @@ fn test_q86_alias_hides_original_table_name() -> Result<()> {
     assert_eq!(rows, strs(&[&["20"]]));
     Ok(())
 }
+
+/// Asymmetric self-JOIN data: 1→2, 2→3, 3→1, so swapped ON sides show.
+const Q92_S: &str = "id,v\n1,2\n2,3\n3,1\n";
+
+#[test]
+fn test_q92_join_on_operand_order_does_not_matter() -> Result<()> {
+    for on in ["a.v = b.id", "b.id = a.v"] {
+        let sql = format!("SELECT a.id, b.id FROM s a JOIN s b ON {on} ORDER BY a.id");
+        let rows = rows_of(&run_query_in_dir("onorder", &[("s", Q92_S)], &sql)?);
+        assert_eq!(
+            rows,
+            strs(&[&["1", "2"], &["2", "3"], &["3", "1"]]),
+            "{sql}"
+        );
+    }
+    let rows = rows_of(&run_query_with_catalog(
+        &fixture("t1.csv"),
+        "SELECT a.name, b.name FROM t1 a JOIN t2 b ON b.t1_id = a.id ORDER BY a.id",
+    )?);
+    assert_eq!(rows, strs(&[&["a", "x"], &["b", "y"]]));
+    Ok(())
+}
+
+#[test]
+fn test_q92_join_on_columns_of_one_side_is_error() {
+    let err = run_query_in_dir(
+        "oneside",
+        &[("s", Q92_S)],
+        "SELECT a.id FROM s a JOIN s b ON a.id = a.v",
+    )
+    .expect_err("ON comparing one side must fail")
+    .to_string();
+    assert!(err.contains("JOIN ON"), "{err}");
+}
+
+#[test]
+fn test_q86_duplicate_table_alias_is_error() {
+    for sql in [
+        "SELECT a.id FROM t1 a JOIN t2 a ON a.id = a.t1_id",
+        "SELECT t1.id FROM t1 JOIN t2 t1 ON t1.id = t1.t1_id",
+    ] {
+        let err = run_query_with_catalog(&fixture("t1.csv"), sql)
+            .err()
+            .unwrap_or_else(|| panic!("expected error: {sql}"))
+            .to_string();
+        assert!(err.contains("duplicate table alias"), "{sql}: {err}");
+    }
+    // An unaliased self-JOIN keeps working as on master.
+    let sql = "SELECT * FROM t1 JOIN t1 ON t1.id = t1.id";
+    assert!(run_query_with_catalog(&fixture("t1.csv"), sql).is_ok());
+}
