@@ -23,10 +23,19 @@ impl CsvScanExec {
             .from_path(path)
             .map_err(|e| anyhow!("cannot open CSV '{}': {}", path, e))?;
 
+        // Tag each column with its table (the file stem, as main.rs maps
+        // `<table>.csv`) so `t.col` resolves exactly after a JOIN (#40).
+        let table = std::path::Path::new(path).file_stem();
         let fields: Vec<Field> = table_schema
             .columns
             .iter()
-            .map(|c| Field::new(&c.name, c.data_type.clone(), true))
+            .map(|c| {
+                let f = Field::new(&c.name, c.data_type.clone(), true);
+                match table.and_then(|t| t.to_str()) {
+                    Some(t) => super::tag_field(f, t, &c.name),
+                    None => f,
+                }
+            })
             .collect();
 
         let schema = Arc::new(Schema::new(fields));

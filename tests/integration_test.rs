@@ -547,19 +547,116 @@ fn test_qualified_order_by() -> Result<()> {
 }
 
 /// After a JOIN whose tables share column names, the right side's columns
-/// are renamed `right_<col>`. A qualified `t2.col` must not silently resolve
-/// to the left table's `col` (#39 review / #40): it is an error instead.
+/// are renamed `right_<col>`. A qualified `t2.col` resolves to the right
+/// table's column by its source-table tag, `t1.col` to the left one (#40).
 #[test]
-fn test_join_name_collision_qualified_right_column_is_error() {
+fn test_join_name_collision_qualified_right_column_resolves() -> Result<()> {
+    let j = "FROM t1 JOIN t2 ON t1.id = t2.t1_id";
+    for (sql, expected) in [
+        (
+            format!("SELECT t2.id, t2.name {j}"),
+            vec![vec!["100", "x"], vec!["300", "y"]],
+        ),
+        (
+            format!("SELECT t1.id, t2.id, t1.name {j}"),
+            vec![vec!["1", "100", "a"], vec!["2", "300", "b"]],
+        ),
+        (
+            format!("SELECT * {j} WHERE t2.id = 300"),
+            vec![vec!["2", "b", "20", "300", "2", "y"]],
+        ),
+        (format!("SELECT t1.name {j} WHERE t2.id = 1"), vec![]),
+        (
+            format!("SELECT t2.name, COUNT(*) {j} GROUP BY t2.name ORDER BY t2.name"),
+            vec![vec!["x", "1"], vec!["y", "1"]],
+        ),
+    ] {
+        let rows = rows_of(&run_query_with_catalog(&fixture("t1.csv"), &sql)?);
+        assert_eq!(rows, expected, "{sql}");
+    }
+    Ok(())
+}
+
+/// An unqualified name present in both JOIN tables is ambiguous (#40).
+#[test]
+fn test_join_unqualified_colliding_column_is_ambiguous() {
     for sql in [
-        "SELECT t2.id, t2.name FROM t1 JOIN t2 ON t1.id = t2.t1_id",
-        "SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t2.id = 300",
-        "SELECT t2.name, COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.t1_id GROUP BY t2.name",
+        "SELECT id FROM t1 JOIN t2 ON t1.id = t2.t1_id",
+        "SELECT t1.v FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE name = 'x'",
+        "SELECT t1.v FROM t1 JOIN t2 ON t1.id = t2.t1_id ORDER BY id",
     ] {
         let res = run_query_with_catalog(&fixture("t1.csv"), sql);
         let err = res.expect_err(sql).to_string();
         assert!(err.contains("ambiguous"), "{sql}: {err}");
     }
+}
+
+/// Run `sql` over CSVs `<table>.csv` written to a fresh temp dir; the first
+/// file is the FROM table, the rest are resolved as JOIN tables.
+fn run_query_in_dir(tag: &str, files: &[(&str, &str)], sql: &str) -> Result<Vec<RecordBatch>> {
+    let dir = std::env::temp_dir().join(format!("ember_q40_{}_{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    for (name, body) in files {
+        std::fs::write(dir.join(format!("{name}.csv")), body)?;
+    }
+    let path = |t: &str| dir.join(format!("{t}.csv")).to_string_lossy().into_owned();
+    let main = path(files[0].0);
+    let schema = ember_query::catalog::infer_schema(Path::new(&main))?;
+    let stmt = ember_query::sql::parse(sql)?;
+    let mut cat = std::collections::HashMap::new();
+    for join in &stmt.joins {
+        let p = path(&join.table);
+        let s = ember_query::catalog::infer_schema(Path::new(&p))?;
+        cat.insert(join.table.clone(), (p, s));
+    }
+    let plan = ember_query::planner::build(&stmt, &main, schema, &cat)?;
+    let mut exec = ember_query::executor::build_executor(plan)?;
+    let mut batches = Vec::new();
+    while let Some(b) = exec.next()? {
+        batches.push(b);
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(batches)
+}
+
+/// orders/customers both have `id`; ORDER BY the right table's `id` must sort
+/// by customers.id, not orders.id (#40).
+#[test]
+fn test_join_order_by_right_table_same_named_column() -> Result<()> {
+    let files = [
+        ("orders", "id,customer_id,amount\n1,20,5\n2,10,7\n3,30,9\n"),
+        ("customers", "id,name\n10,c10\n20,c20\n30,c30\n"),
+    ];
+    let j = "FROM orders JOIN customers ON orders.customer_id = customers.id";
+    for (tag, sql, expected) in [
+        (
+            "sel",
+            format!("SELECT orders.id, customers.id, customers.name {j} ORDER BY customers.id"),
+            vec![
+                vec!["2", "10", "c10"],
+                vec!["1", "20", "c20"],
+                vec!["3", "30", "c30"],
+            ],
+        ),
+        (
+            "hidden",
+            format!("SELECT orders.amount {j} ORDER BY customers.id DESC"),
+            vec![vec!["9"], vec!["5"], vec!["7"]],
+        ),
+        (
+            "star",
+            format!("SELECT * {j} ORDER BY customers.id DESC"),
+            vec![
+                vec!["3", "30", "9", "30", "c30"],
+                vec!["1", "20", "5", "20", "c20"],
+                vec!["2", "10", "7", "10", "c10"],
+            ],
+        ),
+    ] {
+        let rows = rows_of(&run_query_in_dir(tag, &files, &sql)?);
+        assert_eq!(rows, expected, "{sql}");
+    }
+    Ok(())
 }
 
 #[test]
@@ -569,6 +666,77 @@ fn test_join_qualified_unique_columns_still_resolve() -> Result<()> {
         "SELECT t1.v, t2.t1_id FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.v > 10",
     )?;
     assert_eq!(rows_of(&batches), strs(&[&["20", "2"]]));
+    Ok(())
+}
+
+/// A qualified ORDER BY key must not be captured by an output alias of the
+/// same bare name, and t2.id must sort differently from t1.id (#91 review).
+#[test]
+fn test_join_qualified_order_by_not_captured_by_alias() -> Result<()> {
+    let files = [
+        ("t1", "id,name,v\n1,a,20\n2,b,10\n3,c,30\n"),
+        ("t2", "id,t1_id,name\n300,1,x\n100,2,z\n200,3,y\n"),
+    ];
+    let j = "FROM t1 JOIN t2 ON t1.id = t2.t1_id";
+    for (tag, sql, expected) in [
+        (
+            "alias_v",
+            format!("SELECT t2.name AS v {j} ORDER BY t1.v DESC"),
+            vec![vec!["y"], vec!["x"], vec!["z"]],
+        ),
+        (
+            "alias_id",
+            format!("SELECT t1.v AS id {j} ORDER BY t2.id DESC"),
+            vec![vec!["20"], vec!["30"], vec!["10"]],
+        ),
+        (
+            "right_id",
+            format!("SELECT t1.name {j} ORDER BY t2.id DESC"),
+            vec![vec!["a"], vec!["c"], vec!["b"]],
+        ),
+    ] {
+        let rows = rows_of(&run_query_in_dir(tag, &files, &sql)?);
+        assert_eq!(rows, expected, "{sql}");
+    }
+    Ok(())
+}
+
+/// An alias beside its source column, or a repeated column, is not
+/// ambiguous on a single table (same results as before #40).
+#[test]
+fn test_alias_beside_source_column_order_by_still_works() -> Result<()> {
+    let ew = |a: usize| -> Vec<Vec<&str>> {
+        ["east", "east", "east", "west", "west", "west"]
+            .iter()
+            .map(|r| vec![*r; a])
+            .collect()
+    };
+    for sql in [
+        "SELECT region AS r, region FROM orders ORDER BY region",
+        "SELECT region, region AS r FROM orders ORDER BY region",
+    ] {
+        assert_eq!(
+            rows_of(&run_query(&fixture("orders.csv"), sql)?),
+            ew(2),
+            "{sql}"
+        );
+    }
+    let sql = "SELECT qty, qty FROM orders ORDER BY qty";
+    let qty: Vec<Vec<&str>> = ["2", "2", "3", "4", "5", "7"]
+        .iter()
+        .map(|q| vec![*q, *q])
+        .collect();
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), sql)?),
+        qty,
+        "{sql}"
+    );
+    let sql = "SELECT qty AS region, region AS qty FROM orders ORDER BY qty";
+    let col1: Vec<String> = rows_of(&run_query(&fixture("orders.csv"), sql)?)
+        .into_iter()
+        .map(|r| r[1].clone())
+        .collect();
+    assert_eq!(col1, ew(1).concat(), "{sql}");
     Ok(())
 }
 
