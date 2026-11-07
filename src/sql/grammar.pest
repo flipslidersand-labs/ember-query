@@ -7,43 +7,43 @@ COMMENT    = _{ "--" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
 // KW_X is silent and consumes only the keyword; the boundary is checked by the
 // atomic lookahead `X_END` (an atomic rule avoids implicit whitespace skipping).
 KW_SELECT = _{ &SELECT_END ~ ^"SELECT" }
-SELECT_END = @{ ^"SELECT" ~ !(ASCII_ALPHANUMERIC | "_") }
+SELECT_END = @{ ^"SELECT" ~ !ID_CONT }
 KW_FROM = _{ &FROM_END ~ ^"FROM" }
-FROM_END = @{ ^"FROM" ~ !(ASCII_ALPHANUMERIC | "_") }
+FROM_END = @{ ^"FROM" ~ !ID_CONT }
 KW_AS = _{ &AS_END ~ ^"AS" }
-AS_END = @{ ^"AS" ~ !(ASCII_ALPHANUMERIC | "_") }
+AS_END = @{ ^"AS" ~ !ID_CONT }
 KW_INNER = _{ &INNER_END ~ ^"INNER" }
-INNER_END = @{ ^"INNER" ~ !(ASCII_ALPHANUMERIC | "_") }
+INNER_END = @{ ^"INNER" ~ !ID_CONT }
 KW_JOIN = _{ &JOIN_END ~ ^"JOIN" }
-JOIN_END = @{ ^"JOIN" ~ !(ASCII_ALPHANUMERIC | "_") }
+JOIN_END = @{ ^"JOIN" ~ !ID_CONT }
 KW_ON = _{ &ON_END ~ ^"ON" }
-ON_END = @{ ^"ON" ~ !(ASCII_ALPHANUMERIC | "_") }
+ON_END = @{ ^"ON" ~ !ID_CONT }
 KW_WHERE = _{ &WHERE_END ~ ^"WHERE" }
-WHERE_END = @{ ^"WHERE" ~ !(ASCII_ALPHANUMERIC | "_") }
+WHERE_END = @{ ^"WHERE" ~ !ID_CONT }
 KW_GROUP = _{ &GROUP_END ~ ^"GROUP" }
-GROUP_END = @{ ^"GROUP" ~ !(ASCII_ALPHANUMERIC | "_") }
+GROUP_END = @{ ^"GROUP" ~ !ID_CONT }
 KW_BY = _{ &BY_END ~ ^"BY" }
-BY_END = @{ ^"BY" ~ !(ASCII_ALPHANUMERIC | "_") }
+BY_END = @{ ^"BY" ~ !ID_CONT }
 KW_ORDER = _{ &ORDER_END ~ ^"ORDER" }
-ORDER_END = @{ ^"ORDER" ~ !(ASCII_ALPHANUMERIC | "_") }
+ORDER_END = @{ ^"ORDER" ~ !ID_CONT }
 KW_ASC = _{ &ASC_END ~ ^"ASC" }
-ASC_END = @{ ^"ASC" ~ !(ASCII_ALPHANUMERIC | "_") }
+ASC_END = @{ ^"ASC" ~ !ID_CONT }
 KW_DESC = _{ &DESC_END ~ ^"DESC" }
-DESC_END = @{ ^"DESC" ~ !(ASCII_ALPHANUMERIC | "_") }
+DESC_END = @{ ^"DESC" ~ !ID_CONT }
 KW_LIMIT = _{ &LIMIT_END ~ ^"LIMIT" }
-LIMIT_END = @{ ^"LIMIT" ~ !(ASCII_ALPHANUMERIC | "_") }
+LIMIT_END = @{ ^"LIMIT" ~ !ID_CONT }
 KW_OR = _{ &OR_END ~ ^"OR" }
-OR_END = @{ ^"OR" ~ !(ASCII_ALPHANUMERIC | "_") }
+OR_END = @{ ^"OR" ~ !ID_CONT }
 KW_AND = _{ &AND_END ~ ^"AND" }
-AND_END = @{ ^"AND" ~ !(ASCII_ALPHANUMERIC | "_") }
+AND_END = @{ ^"AND" ~ !ID_CONT }
 KW_NOT = _{ &NOT_END ~ ^"NOT" }
-NOT_END = @{ ^"NOT" ~ !(ASCII_ALPHANUMERIC | "_") }
+NOT_END = @{ ^"NOT" ~ !ID_CONT }
 KW_NULL = _{ &NULL_END ~ ^"NULL" }
-NULL_END = @{ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_") }
+NULL_END = @{ ^"NULL" ~ !ID_CONT }
 KW_TRUE = _{ &TRUE_END ~ ^"TRUE" }
-TRUE_END = @{ ^"TRUE" ~ !(ASCII_ALPHANUMERIC | "_") }
+TRUE_END = @{ ^"TRUE" ~ !ID_CONT }
 KW_FALSE = _{ &FALSE_END ~ ^"FALSE" }
-FALSE_END = @{ ^"FALSE" ~ !(ASCII_ALPHANUMERIC | "_") }
+FALSE_END = @{ ^"FALSE" ~ !ID_CONT }
 
 // Top-level rule
 query = { SOI ~ select_stmt ~ ";"? ~ EOI }
@@ -125,7 +125,9 @@ star_arg  = { "*" }
 column_ref = @{ ident ~ ("." ~ ident)? }
 
 // Identifiers
-ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+ident = @{ ID_START ~ ID_CONT* }
+ID_START = _{ XID_START | "_" }
+ID_CONT  = _{ XID_CONTINUE | "_" }
 
 // Literals
 literal = { null_lit | bool_lit | float_lit | integer_lit | string_lit }
