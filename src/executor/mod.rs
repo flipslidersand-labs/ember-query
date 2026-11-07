@@ -54,11 +54,6 @@ fn field_tag(f: &Field) -> Option<(&str, &str)> {
     Some((m.get(TABLE_KEY)?.as_str(), m.get(COLUMN_KEY)?.as_str()))
 }
 
-/// A reference naming `f` unambiguously: `table.column` when tagged.
-pub fn field_ref(f: &Field) -> String {
-    field_tag(f).map_or_else(|| f.name().clone(), |(t, c)| format!("{t}.{c}"))
-}
-
 /// Candidates by source-table tag. `t.col` on a schema tagged with table `t`
 /// matches only `t`'s `col`; a bare `col` matches every table's `col` plus an
 /// exact field name. `None` (tags cannot decide: untagged schema, unknown
@@ -331,9 +326,13 @@ use crate::planner::logical::LogicalPlan;
 
 pub fn build_executor(plan: LogicalPlan) -> Result<Box<dyn Executor>> {
     match plan {
-        LogicalPlan::Scan { path, schema } => {
-            Ok(Box::new(csv_scan::CsvScanExec::new(&path, schema)?))
-        }
+        LogicalPlan::Scan {
+            path,
+            schema,
+            table,
+        } => Ok(Box::new(csv_scan::CsvScanExec::with_table(
+            &path, schema, &table,
+        )?)),
         LogicalPlan::Filter { input, predicate } => {
             let child = build_executor(*input)?;
             Ok(Box::new(filter::FilterExec::new(child, predicate)))
@@ -358,11 +357,15 @@ pub fn build_executor(plan: LogicalPlan) -> Result<Box<dyn Executor>> {
             left,
             right_path,
             right_schema,
+            right_table,
             on,
-            ..
         } => {
             let left_exec = build_executor(*left)?;
-            let right_exec = Box::new(csv_scan::CsvScanExec::new(&right_path, right_schema)?);
+            let right_exec = Box::new(csv_scan::CsvScanExec::with_table(
+                &right_path,
+                right_schema,
+                &right_table,
+            )?);
             Ok(Box::new(join::HashJoinExec::new(
                 left_exec, right_exec, &on,
             )?))
