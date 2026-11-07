@@ -13,7 +13,7 @@ use anyhow::{anyhow, Result};
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute;
 use arrow::compute::kernels::numeric as numeric_kernels;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -50,15 +50,16 @@ pub fn evaluate(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
         Expr::Literal(val) => make_scalar_array(val, batch.num_rows()),
 
         Expr::BinOp { op, left, right } => {
-            let l = evaluate(batch, left)?;
-            let r = evaluate(batch, right)?;
+            let l = evaluate_operand(batch, left)?;
+            let r = evaluate_operand(batch, right)?;
             apply_binop(op, &l, &r)
         }
 
         Expr::Unary { op, expr } => {
-            let arr = evaluate(batch, expr)?;
+            let arr = evaluate_operand(batch, expr)?;
             match op {
                 UnaryOp::Not => {
+                    let arr = coerce_null(&arr, &DataType::Boolean)?;
                     let bool_arr = arr
                         .as_any()
                         .downcast_ref::<BooleanArray>()
@@ -66,6 +67,7 @@ pub fn evaluate(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
                     Ok(Arc::new(compute::not(bool_arr)?) as ArrayRef)
                 }
                 UnaryOp::Neg => {
+                    let arr = coerce_null(&arr, &DataType::Int64)?;
                     // Negate numeric column
                     if let Some(i64_arr) = arr.as_any().downcast_ref::<Int64Array>() {
                         let negated: Int64Array = i64_arr
@@ -117,6 +119,26 @@ pub fn evaluate_bool(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// 演算子のオペランドを評価する。NULL リテラルだけは型未定(`DataType::Null`)のまま返し、
+/// 演算側で相手の型に合わせる。単独の `SELECT NULL` は従来どおり Int64 の NULL 配列。
+fn evaluate_operand(batch: &RecordBatch, expr: &Expr) -> Result<ArrayRef> {
+    match expr {
+        Expr::Literal(Value::Null) => Ok(arrow::array::new_null_array(
+            &DataType::Null,
+            batch.num_rows(),
+        )),
+        _ => evaluate(batch, expr),
+    }
+}
+
+fn coerce_null(arr: &ArrayRef, target: &DataType) -> Result<ArrayRef> {
+    if matches!(arr.data_type(), DataType::Null) {
+        Ok(compute::cast(arr, target)?)
+    } else {
+        Ok(arr.clone())
+    }
+}
+
 fn make_scalar_array(val: &Value, len: usize) -> Result<ArrayRef> {
     match val {
         Value::Int(i) => {
@@ -144,7 +166,19 @@ fn make_scalar_array(val: &Value, len: usize) -> Result<ArrayRef> {
 
 fn apply_binop(op: &BinOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
     use arrow::compute::kernels::cmp as kcmp;
-    use arrow::datatypes::DataType;
+
+    // NULL リテラル(DataType::Null)は相手の型に揃える。論理演算は Boolean、両辺 NULL の算術・比較は Int64
+    let (nl, nr) = (
+        matches!(l.data_type(), DataType::Null),
+        matches!(r.data_type(), DataType::Null),
+    );
+    let target = match op {
+        BinOp::And | BinOp::Or => DataType::Boolean,
+        _ if nl && !nr => r.data_type().clone(),
+        _ if nr && !nl => l.data_type().clone(),
+        _ => DataType::Int64,
+    };
+    let (l, r) = (&coerce_null(l, &target)?, &coerce_null(r, &target)?);
 
     // Int64 と Float64 の混在は Int64 側を Float64 に揃える(arrow は暗黙変換しない)
     let (l, r) = match (l.data_type(), r.data_type()) {
@@ -460,7 +494,6 @@ mod eval_semantics_tests {
     }
 
     #[test]
-    #[ignore = "不具合: NULL リテラルが Int64 配列になり NOT NULL がエラーになる(SQL では NULL)"]
     fn not_null_literal_is_null() {
         let got = evaluate(&batch(), &un(UnaryOp::Not, lit(Value::Null))).unwrap();
         assert_eq!(bools(&got), vec![N; 9]);
@@ -556,7 +589,6 @@ mod eval_semantics_tests {
     }
 
     #[test]
-    #[ignore = "不具合: NULL リテラルが Int64 配列になり `x AND NULL` / `x OR NULL` が型エラーになる"]
     fn and_or_with_null_literal() {
         let b = batch();
         // TRUE AND NULL = NULL, FALSE AND NULL = FALSE
