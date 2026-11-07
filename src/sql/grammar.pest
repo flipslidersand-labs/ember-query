@@ -76,7 +76,7 @@ join_clause = { (KW_INNER ~ KW_JOIN | KW_JOIN) ~ table_ref ~ KW_ON ~ expr }
 where_clause = { KW_WHERE ~ expr }
 
 // GROUP BY clause
-group_by_clause = { KW_GROUP ~ KW_BY ~ ident ~ ("," ~ ident)* }
+group_by_clause = { KW_GROUP ~ KW_BY ~ column_ref ~ ("," ~ column_ref)* }
 
 // ORDER BY clause
 order_by_clause = { KW_ORDER ~ KW_BY ~ order_item ~ ("," ~ order_item)* }
