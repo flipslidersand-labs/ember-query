@@ -69,7 +69,15 @@ impl Executor for CsvScanExec {
             }
             for (col_idx, builder) in builders.iter_mut().enumerate() {
                 let val = record.get(col_idx).unwrap_or("");
-                builder.append(val)?;
+                builder.append(val).map_err(|e| {
+                    let line = record.position().map(|p| p.line()).unwrap_or(0);
+                    anyhow!(
+                        "line {}, column '{}': {}",
+                        line,
+                        self.schema.field(col_idx).name(),
+                        e
+                    )
+                })?;
             }
             rows_read += 1;
         }
@@ -328,8 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn type_deviation_after_sample_window_is_error() {
-        // 101st data row deviates: inference (first 100 rows) says Int64, scan fails.
+    fn type_deviation_after_100_rows_is_inferred_as_utf8() {
         let mut s = String::from("n\n");
         for i in 0..100 {
             s.push_str(&format!("{}\n", i));
@@ -337,9 +344,18 @@ mod tests {
         s.push_str("oops\n");
         let f = TmpCsv::new(&s);
         let ts = infer_schema(&f.0).unwrap();
-        assert_eq!(ts.columns[0].data_type, DataType::Int64);
-        let err = scan_all(&f, ts).unwrap_err();
-        assert!(err.to_string().contains("oops"), "got: {}", err);
+        assert_eq!(ts.columns[0].data_type, DataType::Utf8);
+        assert!(scan_all(&f, ts).is_ok());
+    }
+
+    #[test]
+    fn parse_error_includes_line_and_column_name() {
+        let f = TmpCsv::new("id,n\n1,10\n2,20\n3,N/A\n");
+        let ts = schema_of(&[("id", DataType::Int64), ("n", DataType::Int64)]);
+        let msg = scan_all(&f, ts).unwrap_err().to_string();
+        assert!(msg.contains("line 4"), "got: {}", msg);
+        assert!(msg.contains("column 'n'"), "got: {}", msg);
+        assert!(msg.contains("N/A"), "got: {}", msg);
     }
 
     #[test]

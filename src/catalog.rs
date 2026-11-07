@@ -25,9 +25,10 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
 
     let headers: Vec<String> = reader.headers()?.iter().map(|h| h.to_string()).collect();
 
-    // Collect up to 100 sample rows for type inference.
-    let mut samples: Vec<Vec<String>> = Vec::new();
-    for result in reader.records().take(100) {
+    // Scan every row once, keeping only per-column flags (no records retained),
+    // so the inferred type always matches what the scan will parse.
+    let mut states = vec![ColState::default(); headers.len()];
+    for result in reader.records() {
         let record = result?;
         if record.len() > headers.len() {
             anyhow::bail!(
@@ -36,15 +37,16 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
                 headers.len()
             );
         }
-        samples.push(record.iter().map(|f| f.to_string()).collect());
+        for (state, val) in states.iter_mut().zip(record.iter()) {
+            state.observe(val);
+        }
     }
 
     let mut columns = Vec::with_capacity(headers.len());
-    for (col_idx, name) in headers.iter().enumerate() {
-        let data_type = infer_column_type(&samples, col_idx);
+    for (name, state) in headers.iter().zip(states.iter()) {
         columns.push(ColumnDef {
             name: name.clone(),
-            data_type,
+            data_type: state.data_type(),
         });
     }
 
@@ -64,51 +66,56 @@ fn is_strict_bool_str(s: &str) -> bool {
     parse_bool_str(s).is_some()
 }
 
-fn infer_column_type(samples: &[Vec<String>], col_idx: usize) -> DataType {
-    let mut can_be_int = true;
-    let mut can_be_float = true;
-    let mut can_be_bool = true;
-    let mut has_non_empty = false;
+#[derive(Clone)]
+struct ColState {
+    can_be_int: bool,
+    can_be_float: bool,
+    can_be_bool: bool,
+    has_non_empty: bool,
+}
 
-    for row in samples {
-        let val = match row.get(col_idx) {
-            Some(v) => v.as_str(),
-            None => continue,
-        };
+impl Default for ColState {
+    fn default() -> Self {
+        ColState {
+            can_be_int: true,
+            can_be_float: true,
+            can_be_bool: true,
+            has_non_empty: false,
+        }
+    }
+}
 
+impl ColState {
+    fn observe(&mut self, val: &str) {
         if val.is_empty() {
-            continue; // null — doesn't constrain type
+            return; // null — doesn't constrain type
         }
-        has_non_empty = true;
-
-        if can_be_bool && !is_strict_bool_str(val) {
-            can_be_bool = false;
+        self.has_non_empty = true;
+        if self.can_be_bool && !is_strict_bool_str(val) {
+            self.can_be_bool = false;
         }
-        if can_be_int && val.parse::<i64>().is_err() {
-            can_be_int = false;
+        if self.can_be_int && val.parse::<i64>().is_err() {
+            self.can_be_int = false;
         }
-        if can_be_float && val.parse::<f64>().is_err() {
-            can_be_float = false;
-        }
-
-        if !can_be_int && !can_be_float && !can_be_bool {
-            break;
+        if self.can_be_float && val.parse::<f64>().is_err() {
+            self.can_be_float = false;
         }
     }
 
-    if !has_non_empty {
-        return DataType::Utf8;
-    }
-
-    // Bool takes priority over int (1/0 values would pass int check but prefer bool if only bools present)
-    if can_be_bool {
-        DataType::Boolean
-    } else if can_be_int {
-        DataType::Int64
-    } else if can_be_float {
-        DataType::Float64
-    } else {
-        DataType::Utf8
+    fn data_type(&self) -> DataType {
+        if !self.has_non_empty {
+            return DataType::Utf8;
+        }
+        // Bool takes priority over int (1/0 values would pass int check but prefer bool if only bools present)
+        if self.can_be_bool {
+            DataType::Boolean
+        } else if self.can_be_int {
+            DataType::Int64
+        } else if self.can_be_float {
+            DataType::Float64
+        } else {
+            DataType::Utf8
+        }
     }
 }
 
@@ -194,23 +201,29 @@ mod tests {
         assert_eq!(types("n\n1\n2.5\n"), vec![DataType::Float64]);
     }
 
-    #[test]
-    fn sample_is_limited_to_first_100_rows() {
-        // 100 ints then text: inference only sees the ints.
+    fn n_rows_then(n: usize, tail: &str) -> String {
         let mut s = String::from("n\n");
-        for i in 0..100 {
+        for i in 0..n {
             s.push_str(&format!("{}\n", i));
         }
-        s.push_str("abc\n");
-        assert_eq!(types(&s), vec![DataType::Int64]);
+        s.push_str(tail);
+        s
+    }
 
-        // Text inside the first 100 rows is seen.
-        let mut s = String::from("n\n");
-        for i in 0..99 {
-            s.push_str(&format!("{}\n", i));
-        }
-        s.push_str("abc\n");
-        assert_eq!(types(&s), vec![DataType::Utf8]);
+    #[test]
+    fn text_after_row_100_makes_utf8() {
+        assert_eq!(types(&n_rows_then(100, "N/A\n")), vec![DataType::Utf8]);
+        assert_eq!(types(&n_rows_then(5000, "N/A\n")), vec![DataType::Utf8]);
+    }
+
+    #[test]
+    fn decimal_after_row_100_makes_float() {
+        assert_eq!(types(&n_rows_then(150, "2.5\n")), vec![DataType::Float64]);
+    }
+
+    #[test]
+    fn all_ints_beyond_100_rows_stay_int() {
+        assert_eq!(types(&n_rows_then(1000, "")), vec![DataType::Int64]);
     }
 
     #[test]

@@ -642,3 +642,30 @@ fn test_table_alias_without_as() -> Result<()> {
     assert_eq!(total, 1);
     Ok(())
 }
+
+// #95: 先頭 100 行が整数で 101 行目が N/A の列は、全行推論で Utf8 になる。
+// CSV 読み取り時の "cannot parse 'N/A' as i64" は起きず、文字列として照会できる。
+// (Utf8 列と整数リテラルの比較は別問題で、現状は比較演算の型エラーになる。)
+#[test]
+fn test_type_mismatch_after_row_100_does_not_fail_at_runtime() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ember_query_it95_{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("samp.csv");
+    let mut s = String::from("n\n");
+    for i in 0..100 {
+        s.push_str(&format!("{}\n", i));
+    }
+    s.push_str("N/A\n");
+    std::fs::write(&path, s)?;
+    let p = path.to_str().unwrap();
+    let result = run_query(p, "SELECT n FROM samp WHERE n = '5'");
+    let issue_query = run_query(p, "SELECT n FROM samp WHERE n = 5");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let total: usize = result?.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1);
+    if let Err(e) = issue_query {
+        assert!(!e.to_string().contains("cannot parse"), "got: {e}");
+    }
+    Ok(())
+}
