@@ -894,9 +894,51 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: grammar requires AS for table alias, so `FROM t x` is a parse error (Issue #45 expects alias to be accepted and discarded)"]
     fn from_alias_without_as_is_discarded() {
         let s = parse("SELECT * FROM t x").unwrap();
         assert_eq!(s.select, vec![SelectItem::Wildcard]);
+    }
+
+    #[test]
+    fn from_alias_without_as_before_clauses() {
+        let s = parse("SELECT * FROM t x WHERE a = 1").unwrap();
+        assert!(s.where_.is_some());
+        let s = parse("SELECT * FROM t x GROUP BY a").unwrap();
+        assert_eq!(s.group_by, vec!["a".to_string()]);
+        let s = parse("SELECT * FROM t x ORDER BY a").unwrap();
+        assert_eq!(s.order_by.len(), 1);
+        let s = parse("SELECT * FROM t x LIMIT 1").unwrap();
+        assert_eq!(s.limit, Some(1));
+    }
+
+    #[test]
+    fn from_alias_without_as_with_join() {
+        let s = parse("SELECT * FROM t x JOIN u y ON x.a = y.a").unwrap();
+        assert_eq!(s.joins.len(), 1);
+        assert_eq!(s.joins[0].table, "u");
+        let s = parse("SELECT * FROM t x INNER JOIN u y ON x.a = y.a WHERE x.a = 1").unwrap();
+        assert_eq!(s.joins[0].table, "u");
+        assert!(s.where_.is_some());
+        let s = parse("SELECT * FROM t JOIN u AS y ON t.a = y.a").unwrap();
+        assert_eq!(s.joins[0].table, "u");
+    }
+
+    #[test]
+    fn keywords_after_table_are_not_aliases() {
+        let s = parse("SELECT * FROM t WHERE a = 1").unwrap();
+        assert!(s.where_.is_some());
+        let s = parse("SELECT * FROM t LIMIT 1").unwrap();
+        assert_eq!(s.limit, Some(1));
+        let s = parse("SELECT * FROM t ORDER BY a").unwrap();
+        assert_eq!(s.order_by.len(), 1);
+        let s = parse("SELECT * FROM t GROUP BY a").unwrap();
+        assert_eq!(s.group_by, vec!["a".to_string()]);
+        let s = parse("SELECT * FROM t JOIN u ON t.a = u.a").unwrap();
+        assert_eq!(s.joins[0].table, "u");
+        let s = parse("SELECT * FROM t INNER JOIN u ON t.a = u.a").unwrap();
+        assert_eq!(s.joins.len(), 1);
+        // identifiers that merely start with a keyword are valid aliases
+        assert!(parse("SELECT * FROM t order_x").is_ok());
+        assert!(parse("SELECT * FROM t AS").is_err());
     }
 }
