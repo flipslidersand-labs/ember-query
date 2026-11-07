@@ -109,6 +109,9 @@ pub fn evaluate_bool(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
     let arr = evaluate(batch, expr)?;
     if let Some(b) = arr.as_any().downcast_ref::<BooleanArray>() {
         Ok(b.clone())
+    } else if arr.null_count() == arr.len() && !matches!(arr.data_type(), DataType::Boolean) {
+        // 全行 NULL の配列(NULL リテラル由来の Int64 など)は NULL の述語として扱い、全行を落とす
+        Ok(BooleanArray::new_null(arr.len()))
     } else {
         Err(anyhow!(
             "predicate did not evaluate to boolean; got {:?}",
@@ -698,5 +701,13 @@ mod eval_semantics_tests {
             err.to_string().contains("did not evaluate to boolean"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn evaluate_bool_treats_all_null_int_as_null_boolean() {
+        let b = evaluate_bool(&batch(), &Expr::Literal(Value::Null)).unwrap();
+        let a: ArrayRef = Arc::new(b);
+        assert_eq!(a.len(), batch().num_rows());
+        assert_eq!(a.null_count(), a.len());
     }
 }
