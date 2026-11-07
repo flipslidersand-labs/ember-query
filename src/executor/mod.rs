@@ -37,15 +37,20 @@ pub fn same_column(a: &str, b: &str) -> bool {
 
 /// Resolve a (possibly qualified) column reference to a field index:
 /// exact name first, then a unique `same_column` match. Several matches
-/// are an error rather than a silent pick.
+/// are an error rather than a silent pick. A JOIN renames the right side's
+/// colliding columns to `right_<col>`, so a qualified `t.col` that also has a
+/// `right_col` could mean either table and is ambiguous too.
 pub fn resolve_column(schema: &Schema, name: &str) -> Result<usize> {
     if let Ok(i) = schema.index_of(name) {
         return Ok(i);
     }
     let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
-    let hits: Vec<usize> = (0..names.len())
+    let mut hits: Vec<usize> = (0..names.len())
         .filter(|&i| same_column(names[i], name))
         .collect();
+    if let (false, Some((_, bare))) = (hits.is_empty(), name.rsplit_once('.')) {
+        hits.extend(schema.index_of(&format!("right_{bare}")).ok());
+    }
     match hits.as_slice() {
         [i] => Ok(*i),
         [] => Err(anyhow!("column '{}' not found in schema {:?}", name, names)),
@@ -728,5 +733,20 @@ mod resolve_column_tests {
         let err = resolve_column(&s, "id").unwrap_err().to_string();
         assert!(err.contains("ambiguous"), "{err}");
         assert_eq!(resolve_column(&s, "b.id").unwrap(), 1);
+    }
+
+    #[test]
+    fn qualified_name_colliding_with_join_rename_is_ambiguous() {
+        let s = schema(&["id", "name", "right_id", "t1_id"]);
+        let err = resolve_column(&s, "t2.id").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        // Exact and unqualified names keep resolving as before.
+        assert_eq!(resolve_column(&s, "id").unwrap(), 0);
+        assert_eq!(resolve_column(&s, "right_id").unwrap(), 2);
+        assert_eq!(resolve_column(&s, "t2.name").unwrap(), 1);
+        assert_eq!(resolve_column(&s, "t2.t1_id").unwrap(), 3);
+        // A lone `right_x` column is not a fallback target for `t.x`.
+        let lone = schema(&["right_x"]);
+        assert!(resolve_column(&lone, "t.x").is_err());
     }
 }
