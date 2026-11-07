@@ -100,6 +100,27 @@ fn test_project_null_literal_is_int64() -> Result<()> {
 }
 
 #[test]
+fn test_where_or_null_keeps_true_rows() -> Result<()> {
+    // in_stock = true の3行は TRUE OR NULL = TRUE で残り、false 行は NULL で落ちる
+    let batches = run_query(
+        &sample_csv(),
+        "SELECT name FROM data WHERE in_stock OR NULL",
+    )?;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3);
+    Ok(())
+}
+
+#[test]
+fn test_project_not_null_is_boolean_null() -> Result<()> {
+    use arrow::datatypes::DataType;
+    let batches = run_query(&sample_csv(), "SELECT NOT NULL FROM data")?;
+    assert_eq!(batches[0].column(0).data_type(), &DataType::Boolean);
+    assert_eq!(batches[0].column(0).null_count(), batches[0].num_rows());
+    Ok(())
+}
+
+#[test]
 fn test_project_neg_keeps_input_type() -> Result<()> {
     use arrow::datatypes::DataType;
     assert_eq!(types_of("SELECT -price FROM data")?, [DataType::Int64]);
