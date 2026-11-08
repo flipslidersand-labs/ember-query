@@ -9,6 +9,14 @@ use std::path::Path;
 fn run_query_in_dir(tag: &str, files: &[(&str, &str)], sql: &str) -> Result<Vec<RecordBatch>> {
     let dir = std::env::temp_dir().join(format!("ember_q101_{}_{tag}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
+    // Removes the temp dir on every exit path, including errors.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
     for (name, body) in files {
         std::fs::write(dir.join(format!("{name}.csv")), body)?;
     }
@@ -28,7 +36,6 @@ fn run_query_in_dir(tag: &str, files: &[(&str, &str)], sql: &str) -> Result<Vec<
     while let Some(b) = exec.next()? {
         batches.push(b);
     }
-    std::fs::remove_dir_all(&dir)?;
     Ok(batches)
 }
 
