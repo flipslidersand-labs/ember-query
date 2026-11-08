@@ -1048,4 +1048,30 @@ mod tests {
         // `.` never becomes part of a table name: `a.b` is not a valid table_ref
         assert!(parse("SELECT * FROM a.b").is_err());
     }
+
+    #[test]
+    fn fullwidth_space_is_whitespace() {
+        // U+3000 separates tokens like an ASCII space (#104)
+        let a = parse("SELECT 名前\u{3000}FROM\u{3000}t").unwrap();
+        let b = parse("SELECT 名前 FROM t").unwrap();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        assert!(parse("SELECT *\u{3000}FROM t\u{3000}WHERE\u{3000}a\u{3000}=\u{3000}1").is_ok());
+    }
+
+    #[test]
+    fn fullwidth_space_inside_identifier_or_literal_is_unchanged() {
+        // not part of an identifier: splits it, so `名前<U+3000>x` is two tokens
+        assert!(parse("SELECT 名前\u{3000}x FROM t").is_err());
+        // inside a string literal it stays as data
+        let stmt = parse("SELECT * FROM t WHERE a = 'x\u{3000}y'").unwrap();
+        match stmt.where_.unwrap() {
+            Expr::BinOp { right, .. } => {
+                assert_eq!(
+                    format!("{right:?}"),
+                    format!("{:?}", Expr::Literal(Value::Str("x\u{3000}y".to_string())))
+                )
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }
