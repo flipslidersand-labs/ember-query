@@ -61,13 +61,14 @@ impl HashJoinExec {
         };
         for (col, schema) in [(&left_col, &ls), (&right_col, &rs)] {
             if let Err(e) = crate::executor::resolve_column(schema, col) {
-                if e.to_string().contains("not found") {
-                    return Err(anyhow!(
-                        "column '{col}' not found in JOIN ON: left schema {:?}, right schema {:?}",
-                        names(&ls),
-                        names(&rs)
-                    ));
+                if !e.to_string().contains("not found") {
+                    return Err(e);
                 }
+                return Err(anyhow!(
+                    "column '{col}' not found in JOIN ON: left schema {:?}, right schema {:?}",
+                    names(&ls),
+                    names(&rs)
+                ));
             }
         }
 
