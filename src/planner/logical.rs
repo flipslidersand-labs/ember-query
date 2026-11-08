@@ -134,7 +134,7 @@ impl LogicalPlan {
 /// Every qualified `q.col` (SELECT, WHERE, GROUP BY, ORDER BY, ON) must name a
 /// FROM/JOIN table by its alias, or its name when unaliased (#86).
 fn check_qualifiers(stmt: &SelectStmt) -> Result<()> {
-    let tables: Vec<&str> = std::iter::once(stmt.from.tag())
+    let tables: Vec<String> = std::iter::once(stmt.from.tag())
         .chain(stmt.joins.iter().map(|j| j.tag()))
         .collect();
     // A repeated tag is an error once an alias is involved; an unaliased
@@ -169,7 +169,7 @@ fn check_qualifiers(stmt: &SelectStmt) -> Result<()> {
     }
     for c in cols {
         if let Some((q, _)) = c.rsplit_once('.') {
-            if !tables.contains(&q) {
+            if !tables.iter().any(|t| t == q) {
                 anyhow::bail!("unknown table qualifier '{q}' in '{c}' (tables: {tables:?})");
             }
         }
@@ -191,7 +191,7 @@ pub fn build(
     let mut plan = LogicalPlan::Scan {
         path: path.to_string(),
         schema,
-        table: stmt.from.tag().to_string(),
+        table: stmt.from.tag(),
     };
 
     // 2. JOINs (before filter so ON predicate can reference both sides)
@@ -204,7 +204,7 @@ pub fn build(
             left: Box::new(plan),
             right_path,
             right_schema,
-            right_table: join.tag().to_string(),
+            right_table: join.tag(),
             on: join.on.clone(),
         };
     }
