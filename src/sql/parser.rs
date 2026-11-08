@@ -1059,10 +1059,18 @@ mod tests {
     }
 
     #[test]
-    fn fullwidth_space_inside_identifier_or_literal_is_unchanged() {
-        // not part of an identifier: splits it, so `名前<U+3000>x` is two tokens
-        assert!(parse("SELECT 名前\u{3000}x FROM t").is_err());
-        // inside a string literal it stays as data
+    fn fullwidth_space_splits_identifier_at_its_position() {
+        // U+3000 is not an identifier char: the error is reported at `x`
+        // (col 11), after the skipped U+3000, not at the U+3000 (col 10, pre-fix).
+        let err = parse("SELECT 名前\u{3000}x FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1:11"), "{err}");
+    }
+
+    #[test]
+    fn fullwidth_space_inside_string_literal_is_unchanged() {
+        // Behavior-preserving: also passes on pre-fix code (literals are not whitespace).
         let stmt = parse("SELECT * FROM t WHERE a = 'x\u{3000}y'").unwrap();
         match stmt.where_.unwrap() {
             Expr::BinOp { right, .. } => {
