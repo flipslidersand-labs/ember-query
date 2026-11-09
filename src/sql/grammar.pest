@@ -1,5 +1,5 @@
 // Whitespace and comment handling
-WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" | "\u{3000}" }
 COMMENT    = _{ "--" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
 
 // Keywords require a word boundary: the keyword must not be followed by an
