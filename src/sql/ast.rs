@@ -86,8 +86,8 @@ pub struct TableRef {
 
 impl TableRef {
     /// What columns are qualified with: the alias, else the table name.
-    pub fn tag(&self) -> &str {
-        self.alias.as_deref().unwrap_or(&self.name)
+    pub fn tag(&self) -> String {
+        super::nfc(self.alias.as_deref().unwrap_or(&self.name))
     }
 }
 
@@ -101,8 +101,8 @@ pub struct JoinClause {
 
 impl JoinClause {
     /// What columns are qualified with: the alias, else the table name.
-    pub fn tag(&self) -> &str {
-        self.alias.as_deref().unwrap_or(&self.table)
+    pub fn tag(&self) -> String {
+        super::nfc(self.alias.as_deref().unwrap_or(&self.table))
     }
 }
 

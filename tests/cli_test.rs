@@ -112,6 +112,23 @@ fn missing_join_csv_keeps_not_found_error() {
 }
 
 #[test]
+fn nfc_and_nfd_identifiers_match_headers_either_way() {
+    let nfc = "\u{30AC}";
+    let nfd = "\u{30AB}\u{3099}";
+    let dir = scratch_dir();
+    for (header, label) in [(nfd, "hdr_nfd"), (nfc, "hdr_nfc")] {
+        let csv = dir.join(format!("{label}.csv"));
+        std::fs::write(&csv, format!("{header},b\n1,2\n")).unwrap();
+        for sql_col in [nfc, nfd] {
+            let sql = format!("SELECT {sql_col} FROM {label} WHERE {sql_col} = 1");
+            let out = run(&dir, &csv, &sql, false);
+            assert!(out.status.success(), "{label} {sql}: {}", text(&out.stderr));
+            assert!(text(&out.stdout).contains('1'), "{}", text(&out.stdout));
+        }
+    }
+}
+
+#[test]
 fn fullwidth_space_separates_sql_tokens() {
     let cwd = scratch_dir();
     let out = run(
