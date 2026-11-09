@@ -127,3 +127,17 @@ fn nfc_and_nfd_identifiers_match_headers_either_way() {
         }
     }
 }
+
+#[test]
+fn fullwidth_space_separates_sql_tokens() {
+    let cwd = scratch_dir();
+    let out = run(
+        &cwd,
+        &fixture("jp.csv"),
+        "SELECT 名前\u{3000}FROM\u{3000}jp",
+        false,
+    );
+    assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+    let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(all.contains("りんご"), "output: {all}");
+}

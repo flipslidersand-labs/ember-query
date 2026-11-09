@@ -9,6 +9,14 @@ use std::path::Path;
 fn run_query_in_dir(tag: &str, files: &[(&str, &str)], sql: &str) -> Result<Vec<RecordBatch>> {
     let dir = std::env::temp_dir().join(format!("ember_q101_{}_{tag}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
+    // Removes the temp dir on every exit path, including errors.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
     for (name, body) in files {
         std::fs::write(dir.join(format!("{name}.csv")), body)?;
     }
@@ -28,7 +36,6 @@ fn run_query_in_dir(tag: &str, files: &[(&str, &str)], sql: &str) -> Result<Vec<
     while let Some(b) = exec.next()? {
         batches.push(b);
     }
-    std::fs::remove_dir_all(&dir)?;
     Ok(batches)
 }
 
@@ -124,4 +131,25 @@ fn test_q101_three_way_distinct_tables_names_unique() -> Result<()> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(names, ["id", "x", "right_id", "y", "right2_id", "z"]);
     Ok(())
+}
+
+/// #102: a missing ON column reports both sides' schemas.
+#[test]
+fn join_on_missing_column_error_names_both_schemas() {
+    let err = run_query_in_dir(
+        "102",
+        &[("t1", "id,name,v\n1,a,2\n"), ("t2", "k,t1_id\n1,1\n")],
+        "SELECT * FROM t1 a JOIN t2 b ON b.t1_idd = a.id",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("b.t1_idd"), "{err}");
+    assert!(
+        err.contains("left schema") && err.contains("\"name\""),
+        "{err}"
+    );
+    assert!(
+        err.contains("right schema") && err.contains("\"t1_id\""),
+        "{err}"
+    );
 }
