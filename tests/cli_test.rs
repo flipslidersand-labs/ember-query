@@ -141,3 +141,18 @@ fn fullwidth_space_separates_sql_tokens() {
     let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
     assert!(all.contains("りんご"), "output: {all}");
 }
+
+#[test]
+fn nfc_table_name_with_nfd_file_hints_normalization_form() {
+    let nfc = "\u{30AC}";
+    let nfd = "\u{30AB}\u{3099}";
+    let dir = scratch_dir();
+    std::fs::copy(fixture("sample.csv"), dir.join("sample.csv")).unwrap();
+    std::fs::write(dir.join(format!("{nfd}.csv")), "item_id\n1\n").unwrap();
+    let sql = format!("SELECT * FROM data JOIN {nfc} ON id = item_id");
+    let out = run(&dir, &dir.join("sample.csv"), &sql, false);
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(err.contains("not found in catalog"), "stderr: {err}");
+    assert!(err.contains("normalization"), "stderr: {err}");
+}
