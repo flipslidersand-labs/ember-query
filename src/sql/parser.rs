@@ -128,7 +128,7 @@ fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
             Rule::group_by_clause => {
                 for col in p.into_inner() {
                     if col.as_rule() == Rule::column_ref {
-                        group_by.push(col.as_str().to_string());
+                        group_by.push(super::nfc(col.as_str()));
                     }
                 }
             }
@@ -167,7 +167,7 @@ fn parse_table_ref(pair: Pair<Rule>) -> (String, Option<String>) {
     let (mut name, mut alias) = (String::new(), None);
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::table_alias => alias = Some(p.as_str().to_string()),
+            Rule::table_alias => alias = Some(super::nfc(p.as_str())),
             _ if name.is_empty() => name = p.as_str().to_string(),
             _ => {}
         }
@@ -190,7 +190,7 @@ fn parse_order_item(pair: Pair<Rule>) -> super::ast::OrderByItem {
     let mut inner = pair.into_inner();
     let column = inner
         .next()
-        .map(|p| p.as_str().to_string())
+        .map(|p| super::nfc(p.as_str()))
         .unwrap_or_default();
     let asc = inner
         .find(|p| p.as_rule() == Rule::sort_dir)
@@ -221,7 +221,7 @@ fn parse_select_item(pair: Pair<Rule>) -> Result<SelectItem> {
                 .next()
                 .ok_or_else(|| anyhow!("missing expr in aliased_expr"))?;
             let expr = parse_expr(expr_pair)?;
-            let alias = parts.next().map(|p| p.as_str().to_string());
+            let alias = parts.next().map(|p| super::nfc(p.as_str()));
             Ok(SelectItem::Expr(expr, alias))
         }
         r => Err(anyhow!("unexpected rule in select_item: {:?}", r)),
@@ -247,7 +247,7 @@ fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
         Rule::primary => parse_primary(pair),
         Rule::literal => parse_literal_expr(pair),
         Rule::func_call => parse_func_call(pair),
-        Rule::column_ref => Ok(Expr::Column(pair.as_str().to_string())),
+        Rule::column_ref => Ok(Expr::Column(super::nfc(pair.as_str()))),
         r => Err(anyhow!("unexpected rule in parse_expr: {:?}", r)),
     }
 }
@@ -401,7 +401,7 @@ fn parse_primary(pair: Pair<Rule>) -> Result<Expr> {
         Rule::expr => parse_expr(inner),
         Rule::func_call => parse_func_call(inner),
         Rule::literal => parse_literal_expr(inner),
-        Rule::column_ref => Ok(Expr::Column(inner.as_str().to_string())),
+        Rule::column_ref => Ok(Expr::Column(super::nfc(inner.as_str()))),
         r => Err(anyhow!("unexpected rule in primary: {:?}", r)),
     }
 }
@@ -976,10 +976,14 @@ mod tests {
         assert_eq!(s.joins[0].table, "u");
         // #92: the alias is kept and becomes the qualifier tag.
         assert_eq!(s.joins[0].alias.as_deref(), Some("y"));
-        assert_eq!((s.from.tag(), s.joins[0].tag()), ("t", "y"));
+        assert_eq!((s.from.tag(), s.joins[0].tag()), ("t".into(), "y".into()));
         let s = parse("SELECT * FROM t x JOIN u ON x.a = u.a").unwrap();
         assert_eq!(
-            (s.from.name.as_str(), s.from.tag(), s.joins[0].tag()),
+            (
+                s.from.name.as_str(),
+                s.from.tag().as_str(),
+                s.joins[0].tag().as_str()
+            ),
             ("t", "x", "u")
         );
     }
@@ -1016,6 +1020,22 @@ mod tests {
         );
         assert_eq!(s.order_by[0].column, "価格");
         assert_eq!(s.group_by, vec!["地域".to_string()]);
+    }
+
+    #[test]
+    fn identifiers_are_nfc_normalized() {
+        // NFD `カ` + U+3099 written in SQL equals NFC `ガ`
+        let nfd = "\u{30AB}\u{3099}";
+        let s = parse(&format!(
+            "SELECT {nfd} AS {nfd} FROM t GROUP BY {nfd} ORDER BY {nfd}"
+        ));
+        let s = s.unwrap();
+        assert_eq!(
+            s.select[0],
+            SelectItem::Expr(Expr::Column("\u{30AC}".into()), Some("\u{30AC}".into()))
+        );
+        assert_eq!(s.order_by[0].column, "\u{30AC}");
+        assert_eq!(s.group_by, vec!["\u{30AC}".to_string()]);
     }
 
     #[test]

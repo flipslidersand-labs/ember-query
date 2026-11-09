@@ -23,7 +23,7 @@ pub fn infer_schema(path: &Path) -> Result<TableSchema> {
         .flexible(true)
         .from_path(path)?;
 
-    let headers: Vec<String> = reader.headers()?.iter().map(|h| h.to_string()).collect();
+    let headers: Vec<String> = reader.headers()?.iter().map(crate::sql::nfc).collect();
     let line_offset = physical_line_offset(&reader);
 
     // 空名・重複名は列が黙って参照不能になるためエラー(大文字小文字違いは別名)。
@@ -298,6 +298,13 @@ mod tests {
         let ts = infer_schema(&f.0).unwrap();
         assert_eq!(ts.columns[0].name, "Id");
         assert_eq!(ts.columns[1].name, "id");
+    }
+
+    #[test]
+    fn nfd_header_is_normalized_to_nfc() {
+        let f = TmpCsv::new("\u{30AB}\u{3099},b\n1,2\n");
+        let schema = infer_schema(&f.0).unwrap();
+        assert_eq!(schema.columns[0].name, "\u{30AC}");
     }
 
     #[test]
