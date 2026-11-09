@@ -52,6 +52,26 @@ impl HashJoinExec {
             }
         }
 
+        // Fail early with both schemas so a reversed or misspelled ON is diagnosable (#102).
+        let names = |s: &Schema| {
+            s.fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        };
+        for (col, schema) in [(&left_col, &ls), (&right_col, &rs)] {
+            if let Err(e) = crate::executor::resolve_column(schema, col) {
+                if !e.to_string().contains("not found") {
+                    return Err(e);
+                }
+                return Err(anyhow!(
+                    "column '{col}' not found in JOIN ON: left schema {:?}, right schema {:?}",
+                    names(&ls),
+                    names(&rs)
+                ));
+            }
+        }
+
         // Collect all right batches into a hash map: right_key_value → [row_index, batch_index]
         let mut right_batches: Vec<RecordBatch> = Vec::new();
         while let Some(rb) = right.next()? {
