@@ -24,6 +24,17 @@ struct Cli {
     explain: bool,
 }
 
+/// Find a `*.csv` in `dir` whose stem equals `table` after NFC normalization
+/// but not byte-for-byte (i.e. only the normalization form differs).
+fn normalization_variant(dir: &Path, table: &str) -> Option<String> {
+    let want = sql::nfc(table);
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let stem = name.strip_suffix(".csv")?;
+        (stem != table && sql::nfc(stem) == want).then_some(name)
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -43,6 +54,15 @@ fn main() -> Result<()> {
         // A missing file is left to the planner's "not found in catalog" error;
         // any other failure (bad CSV, permissions) is reported with its cause.
         if !join_path.exists() {
+            if let Some(found) = normalization_variant(base_dir, &join.table) {
+                anyhow::bail!(
+                    "JOIN table '{}' not found in catalog: '{}' exists but its Unicode \
+                     normalization form (NFC/NFD) differs; table names are not normalized, \
+                     so rename the file or use the same form in the SQL",
+                    join.table,
+                    found
+                );
+            }
             continue;
         }
         let s = catalog::infer_schema(&join_path).with_context(|| {
