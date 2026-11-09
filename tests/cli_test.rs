@@ -110,3 +110,17 @@ fn missing_join_csv_keeps_not_found_error() {
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("not found in catalog"));
 }
+
+#[test]
+fn fullwidth_space_separates_sql_tokens() {
+    let cwd = scratch_dir();
+    let out = run(
+        &cwd,
+        &fixture("jp.csv"),
+        "SELECT 名前\u{3000}FROM\u{3000}jp",
+        false,
+    );
+    assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+    let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(all.contains("りんご"), "output: {all}");
+}
