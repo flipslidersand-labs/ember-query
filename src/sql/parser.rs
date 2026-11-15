@@ -14,6 +14,32 @@ const MAX_SQL_LEN: usize = 64 * 1024;
 /// Maximum nesting depth of parentheses plus prefix operators (`NOT`, `-`).
 const MAX_NEST_DEPTH: usize = 128;
 
+/// Maximum depth of the expression tree. Left-deep operator chains (`1+1+...`)
+/// recurse in `evaluate`, so they are bounded separately from the lexical
+/// nesting above; chains of several hundred terms remain valid.
+const MAX_EXPR_DEPTH: usize = 1000;
+
+fn too_deep() -> anyhow::Error {
+    anyhow!("SQL is too deeply nested (max depth {MAX_NEST_DEPTH} for parentheses/NOT/-, {MAX_EXPR_DEPTH} for expressions)")
+}
+
+/// Depth of an expression tree, computed without recursion.
+fn expr_depth(e: &Expr) -> usize {
+    let (mut max, mut stack) = (0, vec![(e, 1usize)]);
+    while let Some((e, d)) = stack.pop() {
+        max = max.max(d);
+        match e {
+            Expr::BinOp { left, right, .. } => {
+                stack.push((left, d + 1));
+                stack.push((right, d + 1));
+            }
+            Expr::Unary { expr, .. } | Expr::Agg { expr, .. } => stack.push((expr, d + 1)),
+            _ => {}
+        }
+    }
+    max
+}
+
 /// Rejects oversized or deeply nested input before the recursive parser runs,
 /// so hostile SQL returns an error instead of overflowing the stack.
 fn check_limits(sql: &str) -> Result<()> {
@@ -60,12 +86,12 @@ fn check_limits(sql: &str) -> Result<()> {
                 }
             }
             c if c.is_ascii_whitespace() => {}
+            // U+3000 is grammar whitespace (WHITESPACE in grammar.pest) and must not reset the run.
+            0xE3 if sql[i..].starts_with('\u{3000}') => i += '\u{3000}'.len_utf8() - 1,
             _ => run = 0,
         }
         if base + run > MAX_NEST_DEPTH {
-            return Err(anyhow!(
-                "SQL is too deeply nested (max depth {MAX_NEST_DEPTH})"
-            ));
+            return Err(too_deep());
         }
         i += 1;
     }
@@ -84,7 +110,34 @@ pub fn parse(sql: &str) -> Result<SelectStmt> {
         .find(|p| p.as_rule() == Rule::select_stmt)
         .ok_or_else(|| anyhow!("no select_stmt found"))?;
 
-    parse_select_stmt(select_stmt)
+    let stmt = parse_select_stmt(select_stmt)?;
+    check_depth(&stmt)?;
+    Ok(stmt)
+}
+
+fn check_depth(stmt: &SelectStmt) -> Result<()> {
+    let exprs = stmt
+        .select
+        .iter()
+        .filter_map(|i| match i {
+            SelectItem::Expr(e, _) => Some(e),
+            SelectItem::Wildcard => None,
+        })
+        .chain(stmt.where_.iter())
+        .chain(stmt.joins.iter().map(|j| &j.on));
+    if exprs.into_iter().any(|e| expr_depth(e) > MAX_EXPR_DEPTH) {
+        return Err(too_deep());
+    }
+    Ok(())
+}
+
+/// Number of operands in a flat operator chain; rejects before the left-deep
+/// tree is built so even dropping it cannot overflow the stack.
+fn chain_guard(n: usize) -> Result<()> {
+    if n > MAX_EXPR_DEPTH {
+        return Err(too_deep());
+    }
+    Ok(())
 }
 
 fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
@@ -254,6 +307,7 @@ fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_or_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
+    chain_guard(children.len())?;
     let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty or_expr"))?)?;
     for right_pair in children {
         let right = parse_expr(right_pair)?;
@@ -268,6 +322,7 @@ fn parse_or_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_and_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
+    chain_guard(children.len())?;
     let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty and_expr"))?)?;
     for right_pair in children {
         let right = parse_expr(right_pair)?;
@@ -330,6 +385,7 @@ fn parse_cmp_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_add_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
+    chain_guard(children.len() / 2)?;
     let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty add_expr"))?)?;
 
     while let Some(op_pair) = children.next() {
@@ -354,6 +410,7 @@ fn parse_add_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_mul_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
+    chain_guard(children.len() / 2)?;
     let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty mul_expr"))?)?;
 
     while let Some(op_pair) = children.next() {
@@ -1101,5 +1158,42 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    fn assert_too_deep(sql: &str) {
+        let err = parse(sql).unwrap_err().to_string();
+        assert!(err.contains("too deeply nested"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn long_left_binop_chain_is_rejected_not_aborted() {
+        // 30000 terms fit in 64KB; the left-deep AST used to overflow evaluate (#128).
+        let sql = format!("SELECT 1{} AS s FROM a", "+1".repeat(30000));
+        assert_too_deep(&sql);
+        for op in ["-", "*", "/"] {
+            assert_too_deep(&format!(
+                "SELECT 1{} AS s FROM a",
+                format!("{op}1").repeat(1100)
+            ));
+        }
+        assert_too_deep(&format!("SELECT * FROM a WHERE x{}", " AND x".repeat(1100)));
+    }
+
+    #[test]
+    fn moderate_binop_chain_still_parses() {
+        nested_ok(&format!("SELECT 1{} AS s FROM a", "+1".repeat(500)));
+    }
+
+    #[test]
+    fn fullwidth_space_does_not_bypass_nesting_limit() {
+        // U+3000 is grammar whitespace (#115); it must not reset the run (#135).
+        assert_too_deep(&format!(
+            "SELECT * FROM t WHERE {}a = 1",
+            "NOT\u{3000}".repeat(200)
+        ));
+        assert_too_deep(&format!(
+            "SELECT * FROM t WHERE a = {}1",
+            "-\u{3000}".repeat(200)
+        ));
     }
 }
