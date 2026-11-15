@@ -365,38 +365,68 @@ fn sort_over_project(
     items: Vec<SelectItem>,
     order_by: &[OrderByItem],
 ) -> LogicalPlan {
-    let names: Vec<String> = items
+    // Every wide column gets a unique internal name, so the final Project
+    // picks by identity, never by a (possibly duplicated) output name.
+    let internal = |i: usize| format!("__ob_{i}");
+    let out_names: Vec<String> = items
         .iter()
         .map(|i| match i {
             SelectItem::Expr(_, Some(a)) => a.clone(),
             SelectItem::Expr(Expr::Column(c), None) => c.clone(),
+            SelectItem::Expr(Expr::Literal(v), None) => format!("{:?}", v),
             _ => "expr".to_string(),
         })
         .collect();
-    let mut wide = items;
-    for o in order_by {
-        let is_alias = wide
-            .iter()
-            .any(|i| matches!(i, SelectItem::Expr(_, Some(a)) if *a == o.column));
-        let is_col = wide.iter().any(
-            |i| matches!(i, SelectItem::Expr(Expr::Column(c), None) if same_column(c, &o.column)),
-        );
-        if !is_alias && !is_col {
-            wide.push(SelectItem::Expr(Expr::Column(o.column.clone()), None));
-        }
-    }
+    let n = items.len();
+    let mut wide: Vec<SelectItem> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            SelectItem::Expr(e, _) => SelectItem::Expr(e.clone(), Some(internal(i))),
+            SelectItem::Wildcard => SelectItem::Wildcard,
+        })
+        .collect();
+    // Rewrite each key to the internal name of the item it denotes: an alias
+    // first, then an unaliased column, else a hidden input column appended.
+    let keys: Vec<OrderByItem> = order_by
+        .iter()
+        .map(|o| {
+            let hit = items
+                .iter()
+                .position(|i| matches!(i, SelectItem::Expr(_, Some(a)) if *a == o.column))
+                .or_else(|| {
+                    items.iter().position(|i| {
+                        matches!(i, SelectItem::Expr(Expr::Column(c), None)
+                            if same_column(c, &o.column))
+                    })
+                });
+            let idx = hit.unwrap_or_else(|| {
+                wide.push(SelectItem::Expr(
+                    Expr::Column(o.column.clone()),
+                    Some(internal(wide.len())),
+                ));
+                wide.len() - 1
+            });
+            OrderByItem {
+                column: internal(idx),
+                ..o.clone()
+            }
+        })
+        .collect();
     let sorted = sort_node(
         LogicalPlan::Project {
             input: Box::new(input),
             exprs: wide,
         },
-        order_by,
+        &keys,
     );
     LogicalPlan::Project {
         input: Box::new(sorted),
-        exprs: names
+        exprs: out_names
             .into_iter()
-            .map(|n| SelectItem::Expr(Expr::Column(n), None))
+            .enumerate()
+            .map(|(i, name)| SelectItem::Expr(Expr::Column(internal(i)), Some(name)))
+            .take(n)
             .collect(),
     }
 }
