@@ -214,10 +214,13 @@ mod tests {
     }
 
     #[test]
-    fn int64_and_float64_do_not_match() {
-        let l = kv_batch(Arc::new(Int64Array::from(vec![1])), vec![1]);
-        let r = kv_batch(Arc::new(Float64Array::from(vec![1.0])), vec![2]);
-        assert_eq!(rows(&run_join(vec![l], vec![r])), 0);
+    fn int64_and_float64_match_by_value() {
+        // #130: Int64 は Float64 に昇格して比較する(WHERE と同じ)
+        let l = kv_batch(Arc::new(Int64Array::from(vec![1, 2])), vec![1, 2]);
+        let r = kv_batch(Arc::new(Float64Array::from(vec![1.0, 2.5])), vec![10, 20]);
+        let out = run_join(vec![l], vec![r]);
+        assert_eq!(rows(&out), 1);
+        assert_eq!(i64_col(&out[0], "right_v"), vec![10]);
     }
 
     #[test]
