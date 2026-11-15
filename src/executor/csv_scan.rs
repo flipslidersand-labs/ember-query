@@ -165,8 +165,8 @@ impl ColBuilder {
                     b.append_null();
                 } else {
                     b.append_value(
-                        val.parse::<f64>()
-                            .map_err(|_| anyhow!("cannot parse '{}' as f64", val))?,
+                        crate::catalog::parse_finite_float(val)
+                            .ok_or_else(|| anyhow!("cannot parse '{}' as f64", val))?,
                     );
                 }
             }
