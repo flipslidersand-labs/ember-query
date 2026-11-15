@@ -229,7 +229,17 @@ fn join_key(arr: &ArrayRef, idx: usize) -> Result<Option<JoinKey>> {
         return Ok(None);
     }
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return Ok(Some(JoinKey::Int(a.value(idx))));
+        let i = a.value(idx);
+        // Int64 = Float64 は Float64 に昇格して比較する(WHERE と同じ規則, #130)。
+        // ただし 2^53 超などで f64 に正確に表せない Int64 は別の値と同一視
+        // されないよう Int のまま持つ(Float とは一致しない)。
+        let f = i as f64;
+        // f < 2^63: i64::MAX は f64 で 2^63 に丸まり `as i64` が飽和するため除外
+        let lim = 2f64.powi(63);
+        if (-lim..lim).contains(&f) && f as i64 == i {
+            return Ok(Some(JoinKey::Float(f.to_bits())));
+        }
+        return Ok(Some(JoinKey::Int(i)));
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
         let v = a.value(idx);
@@ -282,3 +292,48 @@ fn merge_schemas(left: &Schema, right: &Schema) -> Schema {
 // suppress unused import warning for evaluate_bool
 #[allow(unused_imports)]
 use super::evaluate_bool as _;
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+
+    fn k(a: ArrayRef) -> Option<JoinKey> {
+        join_key(&a, 0).unwrap()
+    }
+    fn i(v: i64) -> ArrayRef {
+        Arc::new(Int64Array::from(vec![v]))
+    }
+    fn f(v: f64) -> ArrayRef {
+        Arc::new(Float64Array::from(vec![v]))
+    }
+
+    #[test]
+    fn int_and_float_equal_values_match() {
+        assert_eq!(k(i(1)), k(f(1.0)));
+        assert_eq!(k(i(0)), k(f(-0.0)));
+        assert_eq!(k(i(-5)), k(f(-5.0)));
+        assert_ne!(k(i(1)), k(f(1.5)));
+    }
+
+    #[test]
+    fn large_int_is_not_conflated_with_neighbours() {
+        let big = 1_i64 << 53;
+        // exactly representable: matches the equal float
+        assert_eq!(k(i(big)), k(f(big as f64)));
+        // not representable as f64: must not match the rounded float
+        assert_ne!(k(i(big + 1)), k(f(big as f64)));
+        assert_ne!(k(i(big + 1)), k(i(big)));
+        assert_ne!(k(i(i64::MAX)), k(f(i64::MAX as f64)));
+        assert_eq!(k(i(i64::MAX)), k(i(i64::MAX)));
+    }
+
+    #[test]
+    fn other_types_stay_distinct_and_null_never_matches() {
+        assert_ne!(k(Arc::new(StringArray::from(vec!["1"]))), k(i(1)));
+        assert_ne!(k(Arc::new(BooleanArray::from(vec![true]))), k(i(1)));
+        assert_eq!(k(f(f64::NAN)), k(f(-f64::NAN)));
+        assert_eq!(k(Arc::new(Int64Array::from(vec![None::<i64>]))), None);
+        assert_ne!(k(Arc::new(StringArray::from(vec!["NULL"]))), None);
+    }
+}
