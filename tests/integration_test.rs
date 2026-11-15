@@ -1077,3 +1077,85 @@ fn test_min_max_nan_is_row_order_independent() -> Result<()> {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+// #129: an alias of a computed expression shadows an input column of the same
+// name in ORDER BY, and is resolvable even when other keys are hidden.
+
+fn col0(sql: &str) -> Result<Vec<String>> {
+    Ok(rows_of(&run_query(&fixture("orders.csv"), sql)?)
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect())
+}
+
+#[test]
+fn test_order_by_expr_alias_shadows_input_column() -> Result<()> {
+    // Sorted by the alias (-qty), not by the input qty.
+    let want = ["-7", "-5", "-4", "-3", "-2", "-2"];
+    assert_eq!(
+        col0("SELECT 0 - qty AS qty FROM orders ORDER BY qty, region")?,
+        want
+    );
+    assert_eq!(
+        col0("SELECT 0 - qty AS qty FROM orders ORDER BY qty")?,
+        want
+    );
+    Ok(())
+}
+
+#[test]
+fn test_order_by_expr_alias_with_hidden_column() -> Result<()> {
+    // Non-shadowing alias beside a hidden key (previously "not found").
+    let got = col0("SELECT -qty AS q FROM orders ORDER BY region, q")?;
+    assert_eq!(got.len(), 6);
+    let (east, west) = got.split_at(3);
+    for half in [east, west] {
+        let v: Vec<i64> = half.iter().map(|s| s.parse().unwrap()).collect();
+        assert!(v.windows(2).all(|w| w[0] <= w[1]), "{got:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_agg_order_by_expr_alias() -> Result<()> {
+    let got = col0("SELECT 0 - qty AS qty, COUNT(*) FROM orders GROUP BY qty ORDER BY qty")?;
+    assert_eq!(got, ["-7", "-5", "-4", "-3", "-2"]);
+    let got = col0("SELECT -qty AS q FROM orders GROUP BY region, qty ORDER BY region, q")?;
+    assert_eq!(got, ["-7", "-3", "-2", "-5", "-4", "-2"]);
+    let sql = "SELECT region, 0 - qty AS q FROM orders GROUP BY region, qty ORDER BY q, region";
+    assert_eq!(
+        rows_of(&run_query(&fixture("orders.csv"), sql)?),
+        strs(&[
+            &["east", "-7"],
+            &["west", "-5"],
+            &["west", "-4"],
+            &["east", "-3"],
+            &["east", "-2"],
+            &["west", "-2"],
+        ])
+    );
+    Ok(())
+}
+
+#[test]
+fn test_order_by_expr_alias_keeps_every_output_column() -> Result<()> {
+    // Two unaliased expressions must stay distinct columns.
+    let sql = "SELECT qty + 1, qty + 2, 0 - qty AS q FROM orders ORDER BY region, q";
+    let rows = rows_of(&run_query(&fixture("orders.csv"), sql)?);
+    assert_eq!(rows[0], ["8", "9", "-7"]);
+    assert_eq!(rows[3], ["6", "7", "-5"]);
+    // Wildcard beside an aliased expression.
+    let sql = "SELECT *, 0 - qty AS q FROM orders ORDER BY q, region";
+    let rows = rows_of(&run_query(&fixture("orders.csv"), sql)?);
+    assert_eq!(rows[0], ["104", "4", "7", "east", "-7"]);
+    // Same output name twice: alias first, then the plain column.
+    let sql = "SELECT 0 - qty AS qty, qty FROM orders ORDER BY qty, region";
+    let rows = rows_of(&run_query(&fixture("orders.csv"), sql)?);
+    assert_eq!(rows[0], ["-7", "7"]);
+    assert_eq!(rows[5], ["-2", "2"]);
+    // Qualified column beside a computed alias and a hidden key.
+    let sql = "SELECT orders.order_id, 0 - qty AS q FROM orders ORDER BY region, q";
+    let rows = rows_of(&run_query(&fixture("orders.csv"), sql)?);
+    assert_eq!(rows[0], ["104", "-7"]);
+    Ok(())
+}
