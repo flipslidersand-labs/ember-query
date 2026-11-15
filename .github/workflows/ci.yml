@@ -10,4 +10,4 @@ permissions:
 
 jobs:
   test:
-    uses: flipslidersand-labs/qa-workflows/.github/workflows/rust-test.yml@b79c88ce85af852181f14442c0875a0680faab73 # main
+    uses: flipslidersand-labs/qa-workflows/.github/workflows/rust-test.yml@5a214aeee917c8d8cf18f78d24409af579d27d97 # main
