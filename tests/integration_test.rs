@@ -1059,7 +1059,8 @@ fn test_q86_duplicate_table_alias_is_error() {
     assert!(run_query_with_catalog(&fixture("t1.csv"), sql).is_ok());
 }
 
-// #94: NaN を含む Float 列の MIN/MAX は行順に依存しない(ORDER BY と同じ全順序)。
+// #94/#126: "nan" を含む列は Float ではなく Utf8 と推論され、MIN/MAX は行順に依存しない。
+// (Float 列内の NaN 順序は hash_agg.rs の単体テストで検証)
 #[test]
 fn test_min_max_nan_is_row_order_independent() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("ember_query_94_{}", std::process::id()));
@@ -1071,7 +1072,7 @@ fn test_min_max_nan_is_row_order_independent() -> Result<()> {
         let path = dir.join(name);
         std::fs::write(&path, body)?;
         let batches = run_query(path.to_str().unwrap(), "SELECT MIN(x), MAX(x) FROM data")?;
-        assert_eq!(rows_of(&batches), strs(&[&["1.5", "NaN"]]), "{name}");
+        assert_eq!(rows_of(&batches), strs(&[&["1.5", "nan"]]), "{name}");
     }
     std::fs::remove_dir_all(&dir)?;
     Ok(())
