@@ -100,6 +100,17 @@ fn is_strict_bool_str(s: &str) -> bool {
     parse_bool_str(s).is_some()
 }
 
+/// Float 推論・スキャン共通のパース。有限の十進表記のみ受理し、nan/inf/infinity は拒否する。
+pub fn parse_finite_float(s: &str) -> Option<f64> {
+    if !s
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return None;
+    }
+    s.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
 #[derive(Clone)]
 struct ColState {
     can_be_int: bool,
@@ -131,7 +142,7 @@ impl ColState {
         if self.can_be_int && val.parse::<i64>().is_err() {
             self.can_be_int = false;
         }
-        if self.can_be_float && val.parse::<f64>().is_err() {
+        if self.can_be_float && parse_finite_float(val).is_none() {
             self.can_be_float = false;
         }
     }
@@ -202,6 +213,32 @@ mod tests {
                 DataType::Boolean
             ]
         );
+    }
+
+    #[test]
+    fn nan_inf_only_columns_are_utf8() {
+        let t = types("a,b,c\nNaN,inf,Infinity\nnan,-inf,+INFINITY\n");
+        assert_eq!(t, vec![DataType::Utf8; 3]);
+    }
+
+    #[test]
+    fn float_mixed_with_nan_is_utf8() {
+        let t = types("a\n1.5\nNaN\n");
+        assert_eq!(t, vec![DataType::Utf8]);
+    }
+
+    #[test]
+    fn exponent_and_signed_decimals_are_float64() {
+        let t = types("a,b,c\n1e3,-.5,+2.\n1.5E-2,3,4\n");
+        assert_eq!(t, vec![DataType::Float64; 3]);
+    }
+
+    #[test]
+    fn parse_finite_float_rejects_non_decimal() {
+        for s in ["nan", "inf", "-Infinity", "1e999", "", " 1", "0x10", "1_0"] {
+            assert!(parse_finite_float(s).is_none(), "{s}");
+        }
+        assert_eq!(parse_finite_float("1e3"), Some(1000.0));
     }
 
     #[test]
