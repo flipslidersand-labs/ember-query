@@ -1076,3 +1076,50 @@ fn test_min_max_nan_is_row_order_independent() -> Result<()> {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+// #129: an alias of a computed expression shadows an input column of the same
+// name in ORDER BY, and is resolvable even when other keys are hidden.
+
+fn col0(sql: &str) -> Result<Vec<String>> {
+    Ok(rows_of(&run_query(&fixture("orders.csv"), sql)?)
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect())
+}
+
+#[test]
+fn test_order_by_expr_alias_shadows_input_column() -> Result<()> {
+    // Sorted by the alias (-qty), not by the input qty.
+    let want = ["-7", "-5", "-4", "-3", "-2", "-2"];
+    assert_eq!(
+        col0("SELECT 0 - qty AS qty FROM orders ORDER BY qty, region")?,
+        want
+    );
+    assert_eq!(
+        col0("SELECT 0 - qty AS qty FROM orders ORDER BY qty")?,
+        want
+    );
+    Ok(())
+}
+
+#[test]
+fn test_order_by_expr_alias_with_hidden_column() -> Result<()> {
+    // Non-shadowing alias beside a hidden key (previously "not found").
+    let got = col0("SELECT -qty AS q FROM orders ORDER BY region, q")?;
+    assert_eq!(got.len(), 6);
+    let (east, west) = got.split_at(3);
+    for half in [east, west] {
+        let v: Vec<i64> = half.iter().map(|s| s.parse().unwrap()).collect();
+        assert!(v.windows(2).all(|w| w[0] <= w[1]), "{got:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_agg_order_by_expr_alias() -> Result<()> {
+    let got = col0("SELECT 0 - qty AS qty, COUNT(*) FROM orders GROUP BY qty ORDER BY qty")?;
+    assert_eq!(got, ["-7", "-5", "-4", "-3", "-2"]);
+    let got = col0("SELECT -qty AS q FROM orders GROUP BY qty ORDER BY q")?;
+    assert_eq!(got, ["-7", "-5", "-4", "-3", "-2"]);
+    Ok(())
+}
