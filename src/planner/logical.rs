@@ -229,21 +229,32 @@ pub fn build(
         .iter()
         .any(|i| matches!(i, SelectItem::Expr(e, _) if contains_agg(e)));
     if !aggs.is_empty() || !stmt.group_by.is_empty() || nested_agg {
-        agg_project = Some(agg_select_list(&stmt.select, &stmt.group_by)?);
+        let items = agg_select_list(&stmt.select, &stmt.group_by)?;
+        agg_project = Some(items);
         check_unique_agg_outputs(&stmt.group_by, &aggs)?;
         plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
             group_by: stmt.group_by.clone(),
             aggs,
         };
-        plan = sort_node(plan, &resolve_order_aliases(&stmt.select, &stmt.order_by));
+        if orders_by_expr_alias(&stmt.select, &stmt.order_by) {
+            // An alias of a computed expression only exists after the Project.
+            let items = agg_project.take().unwrap_or_default();
+            plan = sort_over_project(plan, items, &stmt.order_by);
+        } else {
+            plan = sort_node(plan, &resolve_order_aliases(&stmt.select, &stmt.order_by));
+        }
     } else if let Some(order_by) = hidden_order_by(&stmt.select, &stmt.order_by) {
-        // 5/6. ORDER BY refers to columns the SELECT list drops: sort the
-        // Project's input, then project.
-        plan = LogicalPlan::Project {
-            input: Box::new(sort_node(plan, &order_by)),
-            exprs: stmt.select.clone(),
-        };
+        if orders_by_expr_alias(&stmt.select, &stmt.order_by) {
+            plan = sort_over_project(plan, stmt.select.clone(), &stmt.order_by);
+        } else {
+            // 5/6. ORDER BY refers to columns the SELECT list drops: sort the
+            // Project's input, then project.
+            plan = LogicalPlan::Project {
+                input: Box::new(sort_node(plan, &order_by)),
+                exprs: stmt.select.clone(),
+            };
+        }
     } else {
         // 5/6. Project (non-aggregate), then Sort on its output
         plan = LogicalPlan::Project {
@@ -332,6 +343,91 @@ fn check_grouped(expr: &Expr, group_by: &[String]) -> Result<()> {
         }
         Expr::Unary { expr, .. } => check_grouped(expr, group_by),
         _ => Ok(()),
+    }
+}
+
+/// True when an ORDER BY key names the alias of a computed (non-column,
+/// non-aggregate) SELECT expression. Such a key shadows any input column of
+/// the same name and can only be resolved on the Project's output.
+fn orders_by_expr_alias(select: &[SelectItem], order_by: &[OrderByItem]) -> bool {
+    order_by.iter().any(|o| {
+        select.iter().any(|i| {
+            matches!(i, SelectItem::Expr(e, Some(a))
+                if *a == o.column && !matches!(e, Expr::Column(_) | Expr::Agg { .. }))
+        })
+    })
+}
+
+/// Project(items + ORDER BY columns the items drop) -> Sort -> Project back to
+/// `items`' output names, so aliases and hidden input columns both resolve.
+fn sort_over_project(
+    input: LogicalPlan,
+    items: Vec<SelectItem>,
+    order_by: &[OrderByItem],
+) -> LogicalPlan {
+    // Every wide column gets a unique internal name, so the final Project
+    // picks by identity, never by a (possibly duplicated) output name.
+    let internal = |i: usize| format!("__ob_{i}");
+    let out_names: Vec<String> = items
+        .iter()
+        .map(|i| match i {
+            SelectItem::Expr(_, Some(a)) => a.clone(),
+            SelectItem::Expr(Expr::Column(c), None) => c.clone(),
+            SelectItem::Expr(Expr::Literal(v), None) => format!("{:?}", v),
+            _ => "expr".to_string(),
+        })
+        .collect();
+    let n = items.len();
+    let mut wide: Vec<SelectItem> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            SelectItem::Expr(e, _) => SelectItem::Expr(e.clone(), Some(internal(i))),
+            SelectItem::Wildcard => SelectItem::Wildcard,
+        })
+        .collect();
+    // Rewrite each key to the internal name of the item it denotes: an alias
+    // first, then an unaliased column, else a hidden input column appended.
+    let keys: Vec<OrderByItem> = order_by
+        .iter()
+        .map(|o| {
+            let hit = items
+                .iter()
+                .position(|i| matches!(i, SelectItem::Expr(_, Some(a)) if *a == o.column))
+                .or_else(|| {
+                    items.iter().position(|i| {
+                        matches!(i, SelectItem::Expr(Expr::Column(c), None)
+                            if same_column(c, &o.column))
+                    })
+                });
+            let idx = hit.unwrap_or_else(|| {
+                wide.push(SelectItem::Expr(
+                    Expr::Column(o.column.clone()),
+                    Some(internal(wide.len())),
+                ));
+                wide.len() - 1
+            });
+            OrderByItem {
+                column: internal(idx),
+                ..o.clone()
+            }
+        })
+        .collect();
+    let sorted = sort_node(
+        LogicalPlan::Project {
+            input: Box::new(input),
+            exprs: wide,
+        },
+        &keys,
+    );
+    LogicalPlan::Project {
+        input: Box::new(sorted),
+        exprs: out_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| SelectItem::Expr(Expr::Column(internal(i)), Some(name)))
+            .take(n)
+            .collect(),
     }
 }
 
@@ -658,6 +754,19 @@ mod tests {
                 _ => panic!("expected Sort"),
             },
             _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn order_by_expr_alias_sorts_between_two_projects() {
+        for sql in [
+            "SELECT 0 - id AS id FROM a ORDER BY id, name",
+            "SELECT -id AS q FROM a ORDER BY name, q",
+            "SELECT 0 - id AS id, COUNT(*) FROM a GROUP BY id ORDER BY id",
+        ] {
+            let p = plan(sql).unwrap();
+            let s = shape(&p);
+            assert_eq!(&s[..3], &["Project", "Sort", "Project"], "{sql}");
         }
     }
 
