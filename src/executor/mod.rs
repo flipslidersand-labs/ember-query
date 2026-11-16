@@ -189,8 +189,9 @@ pub fn evaluate_bool(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
     let arr = evaluate(batch, expr)?;
     if let Some(b) = arr.as_any().downcast_ref::<BooleanArray>() {
         Ok(b.clone())
-    } else if arr.null_count() == arr.len() && !matches!(arr.data_type(), DataType::Boolean) {
-        // 全行 NULL の配列(NULL リテラル由来の Int64 など)は NULL の述語として扱い、全行を落とす
+    } else if matches!(expr, Expr::Literal(Value::Null)) {
+        // `WHERE NULL` は NULL の述語として扱い、全行を落とす。
+        // 列が全行 NULL でも非 Boolean なら、バッチの中身に依らず型エラーにする
         Ok(BooleanArray::new_null(arr.len()))
     } else {
         Err(anyhow!(
@@ -856,6 +857,19 @@ mod eval_semantics_tests {
         let a: ArrayRef = Arc::new(b);
         assert_eq!(a.len(), batch().num_rows());
         assert_eq!(a.null_count(), a.len());
+    }
+
+    #[test]
+    fn evaluate_bool_rejects_all_null_non_boolean_column() {
+        // 全行 NULL の Int64 列でも、バッチの中身に関係なく型エラーにする
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>, None]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let b = RecordBatch::try_new(schema, vec![a]).unwrap();
+        let err = evaluate_bool(&b, &col("v")).unwrap_err();
+        assert!(
+            err.to_string().contains("did not evaluate to boolean"),
+            "{err}"
+        );
     }
 }
 
