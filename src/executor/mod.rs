@@ -189,8 +189,9 @@ pub fn evaluate_bool(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
     let arr = evaluate(batch, expr)?;
     if let Some(b) = arr.as_any().downcast_ref::<BooleanArray>() {
         Ok(b.clone())
-    } else if arr.null_count() == arr.len() && !matches!(arr.data_type(), DataType::Boolean) {
-        // 全行 NULL の配列(NULL リテラル由来の Int64 など)は NULL の述語として扱い、全行を落とす
+    } else if matches!(expr, Expr::Literal(Value::Null)) {
+        // `WHERE NULL` は NULL の述語として扱い、全行を落とす。
+        // 列が全行 NULL でも非 Boolean なら、バッチの中身に依らず型エラーにする
         Ok(BooleanArray::new_null(arr.len()))
     } else {
         Err(anyhow!(
@@ -277,9 +278,12 @@ fn apply_binop(op: &BinOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
         BinOp::Mul => Ok(numeric_kernels::mul(l, r)?),
         BinOp::Div => {
             // arrow の Float 除算は inf / NaN を返す。Int(Divide by zero エラー)に揃える。
-            // NULL の行は検出対象外(NULL のまま)。0.0 と -0.0 は `== 0.0` で両方一致。
+            // 分子か除数が NULL の行は検出対象外(NULL のまま)。0.0 と -0.0 は `== 0.0` で両方一致。
             if let Some(d) = r.as_any().downcast_ref::<Float64Array>() {
-                if d.iter().any(|v| v == Some(0.0)) {
+                if d.iter()
+                    .enumerate()
+                    .any(|(i, v)| v == Some(0.0) && l.is_valid(i))
+                {
                     return Err(arrow::error::ArrowError::DivideByZero.into());
                 }
             }
@@ -781,6 +785,24 @@ mod eval_semantics_tests {
         assert_eq!(f, &Float64Array::from(vec![Some(0.5), None, None]));
     }
 
+    #[test]
+    fn float_division_null_numerator_with_zero_divisor_stays_null() {
+        // 分子 NULL の行は除数 0.0 でもエラーにせず NULL(Int の `NULL / 0` と同じ)
+        let got = div_f(
+            Float64Array::from(vec![None, Some(3.0)]),
+            Float64Array::from(vec![Some(0.0), Some(2.0)]),
+        )
+        .unwrap();
+        let f = got.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(f, &Float64Array::from(vec![None, Some(1.5)]));
+        // 非 NULL / 0.0 は従来どおりエラー
+        assert!(div_f(
+            Float64Array::from(vec![None, Some(1.0)]),
+            Float64Array::from(vec![Some(0.0), Some(0.0)])
+        )
+        .is_err());
+    }
+
     // ── 文字列比較 ──
 
     #[test]
@@ -856,6 +878,19 @@ mod eval_semantics_tests {
         let a: ArrayRef = Arc::new(b);
         assert_eq!(a.len(), batch().num_rows());
         assert_eq!(a.null_count(), a.len());
+    }
+
+    #[test]
+    fn evaluate_bool_rejects_all_null_non_boolean_column() {
+        // 全行 NULL の Int64 列でも、バッチの中身に関係なく型エラーにする
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>, None]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let b = RecordBatch::try_new(schema, vec![a]).unwrap();
+        let err = evaluate_bool(&b, &col("v")).unwrap_err();
+        assert!(
+            err.to_string().contains("did not evaluate to boolean"),
+            "{err}"
+        );
     }
 }
 

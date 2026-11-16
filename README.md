@@ -66,4 +66,6 @@ cargo test   # unit + E2E tests / テスト実行
 
 ---
 
+Docs / ドキュメント: [CHANGELOG](CHANGELOG.md) · [spec](docs/spec.md) · [data model](docs/data-model.md) · [tech stack](docs/tech-stack.md) · [ADRs](docs/adr/)
+
 Track progress in [GitHub Issues](https://github.com/flipslidersand-labs/ember-query/issues).

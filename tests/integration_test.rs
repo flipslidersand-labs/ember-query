@@ -591,6 +591,18 @@ fn test_join_unqualified_colliding_column_is_ambiguous() {
     }
 }
 
+/// ORDER BY a bare name matching several unaliased SELECT columns is ambiguous
+/// even when an expression alias in the list routes through the alias path (#145).
+#[test]
+fn test_order_by_ambiguous_with_expr_alias_is_error() {
+    let sql = "SELECT t1.name, t2.name, 0-t1.v AS q FROM t1 JOIN t2 ON t1.id = t2.t1_id \
+               ORDER BY name, q, t1.id";
+    let err = run_query_with_catalog(&fixture("t1.csv"), sql)
+        .expect_err(sql)
+        .to_string();
+    assert!(err.contains("ambiguous"), "{err}");
+}
+
 /// Run `sql` over CSVs `<table>.csv` written to a fresh temp dir; the first
 /// file is the FROM table, the rest are resolved as JOIN tables.
 fn run_query_in_dir(tag: &str, files: &[(&str, &str)], sql: &str) -> Result<Vec<RecordBatch>> {
@@ -1158,4 +1170,36 @@ fn test_order_by_expr_alias_keeps_every_output_column() -> Result<()> {
     let rows = rows_of(&run_query(&fixture("orders.csv"), sql)?);
     assert_eq!(rows[0], ["104", "-7"]);
     Ok(())
+}
+
+// ── #131: 0 行でも存在しない列は検出する ──
+
+#[test]
+fn test_missing_projection_column_errors_with_zero_rows() {
+    let err = run_query(
+        &sample_csv(),
+        "SELECT nope FROM data WHERE price > 100000000",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("nope"), "{err}");
+}
+
+#[test]
+fn test_missing_order_by_column_errors_with_zero_rows() {
+    let err = run_query(
+        &sample_csv(),
+        "SELECT * FROM data WHERE price > 100000000 ORDER BY zzz",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("zzz"), "{err}");
+}
+
+#[test]
+fn test_missing_count_column_errors_with_zero_rows() {
+    let err = run_query(
+        &sample_csv(),
+        "SELECT COUNT(nope) FROM data WHERE price > 100000000",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("nope"), "{err}");
 }

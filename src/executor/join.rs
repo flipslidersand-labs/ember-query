@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use arrow::array::{Array, ArrayRef};
+use arrow::array::ArrayRef;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
@@ -17,18 +17,30 @@ use crate::sql::ast::Expr;
 pub struct HashJoinExec {
     /// Merged schema: left fields then right fields (with table prefix on collision)
     schema: SchemaRef,
-    /// All joined batches (materialised)
-    batches: Vec<RecordBatch>,
-    cursor: usize,
+    left: Box<dyn Executor>,
+    left_col: String,
+    /// Whole build (right) side as one batch
+    right_all: RecordBatch,
+    build_map: HashMap<JoinKey, Vec<u32>>,
+    /// Probe position in the current left batch
+    cur: Option<Probe>,
     done: bool,
 }
 
+/// Upper bound on rows per output batch, so a duplicate-key fan-out is
+/// produced incrementally instead of all at once (#133).
+const MAX_OUTPUT_ROWS: usize = 8192;
+
+struct Probe {
+    batch: RecordBatch,
+    probe: ArrayRef,
+    row: usize,
+    /// Offset into the matches of `row` already emitted
+    m_off: usize,
+}
+
 impl HashJoinExec {
-    pub fn new(
-        mut left: Box<dyn Executor>,
-        mut right: Box<dyn Executor>,
-        on: &Expr,
-    ) -> Result<Self> {
+    pub fn new(left: Box<dyn Executor>, mut right: Box<dyn Executor>, on: &Expr) -> Result<Self> {
         // Extract equality columns from the ON expression
         let (mut left_col, mut right_col) = extract_eq_columns(on).ok_or_else(|| {
             anyhow!("JOIN ON must be an equality expression (left_col = right_col)")
@@ -72,101 +84,122 @@ impl HashJoinExec {
             }
         }
 
-        // Collect all right batches into a hash map: right_key_value → [row_index, batch_index]
+        // Build side: collect the right input into one batch (input-proportional).
+        let right_schema = right.schema();
         let mut right_batches: Vec<RecordBatch> = Vec::new();
         while let Some(rb) = right.next()? {
             right_batches.push(rb);
         }
+        let right_all = arrow::compute::concat_batches(&right_schema, &right_batches)?;
+        drop(right_batches);
 
-        // Build hash map: typed key → Vec<(batch_idx, row_idx)>. NULL keys are skipped.
-        let mut build_map: HashMap<JoinKey, Vec<(usize, usize)>> = HashMap::new();
-        for (b_idx, batch) in right_batches.iter().enumerate() {
-            let key_arr = eval_column_str(batch, &right_col)?;
-            for r_idx in 0..batch.num_rows() {
+        // Build hash map: typed key → right row indices (in order). NULL keys are skipped.
+        let mut build_map: HashMap<JoinKey, Vec<u32>> = HashMap::new();
+        if right_all.num_rows() > 0 {
+            let key_arr = eval_column_str(&right_all, &right_col)?;
+            for r_idx in 0..right_all.num_rows() {
                 if let Some(key) = join_key(&key_arr, r_idx)? {
-                    build_map.entry(key).or_default().push((b_idx, r_idx));
+                    build_map
+                        .entry(key)
+                        .or_default()
+                        .push(u32::try_from(r_idx)?);
                 }
             }
         }
 
         // Build merged schema (left || right, with "right." prefix on name conflicts)
-        let left_schema = left.schema();
-        let right_schema = right.schema();
-        let merged_schema = merge_schemas(&left_schema, &right_schema);
-        let schema = Arc::new(merged_schema);
-
-        // Probe: for each left row, find matching right rows and emit merged rows
-        let mut result_batches: Vec<RecordBatch> = Vec::new();
-        while let Some(left_batch) = left.next()? {
-            let probe_arr = eval_column_str(&left_batch, &left_col)?;
-            let mut matched_left_indices: Vec<usize> = Vec::new();
-            let mut matched_right_batch_indices: Vec<usize> = Vec::new();
-            let mut matched_right_row_indices: Vec<usize> = Vec::new();
-
-            for l_row in 0..left_batch.num_rows() {
-                let Some(key) = join_key(&probe_arr, l_row)? else {
-                    continue; // NULL never matches
-                };
-                if let Some(matches) = build_map.get(&key) {
-                    for &(rb_idx, rr_idx) in matches {
-                        matched_left_indices.push(l_row);
-                        matched_right_batch_indices.push(rb_idx);
-                        matched_right_row_indices.push(rr_idx);
-                    }
-                }
-            }
-
-            if matched_left_indices.is_empty() {
-                continue;
-            }
-
-            // Build output batch by taking matching rows
-            let n = matched_left_indices.len();
-            let mut columns: Vec<ArrayRef> = Vec::new();
-
-            // Left columns
-            for col in left_batch.columns() {
-                let selected: Vec<ArrayRef> = matched_left_indices
-                    .iter()
-                    .map(|&idx| col.slice(idx, 1))
-                    .collect();
-                let refs: Vec<&dyn Array> = selected.iter().map(|a| a.as_ref()).collect();
-                columns.push(arrow::compute::concat(&refs)?);
-            }
-
-            // Right columns (from potentially different batches)
-            for col_idx in 0..right_batches[0].num_columns() {
-                let mut parts: Vec<ArrayRef> = Vec::new();
-                for i in 0..n {
-                    let rb = &right_batches[matched_right_batch_indices[i]];
-                    let row = matched_right_row_indices[i];
-                    parts.push(rb.column(col_idx).slice(row, 1));
-                }
-                let refs: Vec<&dyn Array> = parts.iter().map(|a| a.as_ref()).collect();
-                columns.push(arrow::compute::concat(&refs)?);
-            }
-
-            result_batches.push(RecordBatch::try_new(schema.clone(), columns)?);
-        }
+        let schema = Arc::new(merge_schemas(&left.schema(), &right_schema));
 
         Ok(HashJoinExec {
             schema,
-            batches: result_batches,
-            cursor: 0,
+            left,
+            left_col,
+            right_all,
+            build_map,
+            cur: None,
             done: false,
         })
+    }
+
+    /// Load the next left batch that has rows. Returns false at end of input.
+    fn advance_left(&mut self) -> Result<bool> {
+        while let Some(batch) = self.left.next()? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let probe = eval_column_str(&batch, &self.left_col)?;
+            self.cur = Some(Probe {
+                batch,
+                probe,
+                row: 0,
+                m_off: 0,
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Build at most MAX_OUTPUT_ROWS rows from the current left batch.
+    fn emit(&mut self) -> Result<Option<RecordBatch>> {
+        let Some(cur) = self.cur.as_mut() else {
+            return Ok(None);
+        };
+        let mut left_idx: Vec<u32> = Vec::new();
+        let mut right_idx: Vec<u32> = Vec::new();
+        let n_rows = cur.batch.num_rows();
+        while cur.row < n_rows && left_idx.len() < MAX_OUTPUT_ROWS {
+            let matches = match join_key(&cur.probe, cur.row)? {
+                Some(key) => self.build_map.get(&key),
+                None => None, // NULL never matches
+            };
+            if let Some(m) = matches {
+                let take = (m.len() - cur.m_off).min(MAX_OUTPUT_ROWS - left_idx.len());
+                for &r in &m[cur.m_off..cur.m_off + take] {
+                    left_idx.push(u32::try_from(cur.row)?);
+                    right_idx.push(r);
+                }
+                cur.m_off += take;
+                if cur.m_off < m.len() {
+                    break; // output full mid-row; resume here
+                }
+            }
+            cur.row += 1;
+            cur.m_off = 0;
+        }
+        let exhausted = cur.row >= n_rows;
+        let result = if left_idx.is_empty() {
+            None
+        } else {
+            let li = arrow::array::UInt32Array::from(left_idx);
+            let ri = arrow::array::UInt32Array::from(right_idx);
+            let mut columns: Vec<ArrayRef> = Vec::new();
+            for col in cur.batch.columns() {
+                columns.push(arrow::compute::take(col.as_ref(), &li, None)?);
+            }
+            for col in self.right_all.columns() {
+                columns.push(arrow::compute::take(col.as_ref(), &ri, None)?);
+            }
+            Some(RecordBatch::try_new(self.schema.clone(), columns)?)
+        };
+        if exhausted {
+            self.cur = None;
+        }
+        Ok(result)
     }
 }
 
 impl Executor for HashJoinExec {
     fn next(&mut self) -> Result<Option<RecordBatch>> {
-        if self.done || self.cursor >= self.batches.len() {
-            self.done = true;
-            return Ok(None);
+        while !self.done {
+            if self.cur.is_none() && !self.advance_left()? {
+                self.done = true;
+                break;
+            }
+            if let Some(b) = self.emit()? {
+                return Ok(Some(b));
+            }
         }
-        let batch = self.batches[self.cursor].clone();
-        self.cursor += 1;
-        Ok(Some(batch))
+        Ok(None)
     }
 
     fn schema(&self) -> SchemaRef {
