@@ -14,30 +14,43 @@ const MAX_SQL_LEN: usize = 64 * 1024;
 /// Maximum nesting depth of parentheses plus prefix operators (`NOT`, `-`).
 const MAX_NEST_DEPTH: usize = 128;
 
-/// Maximum depth of the expression tree. Left-deep operator chains (`1+1+...`)
-/// recurse in `evaluate`, so they are bounded separately from the lexical
-/// nesting above; chains of several hundred terms remain valid.
-const MAX_EXPR_DEPTH: usize = 1000;
+/// Maximum cumulative depth of the expression tree, counting operator chains
+/// (`1+1+...`), comparisons, `NOT`, unary minus, aggregates and parentheses
+/// together. Left-deep chains recurse in `evaluate` and in the AST's `Drop`, so
+/// the sum along any nesting path is bounded, not each chain on its own (#138).
+/// The value is below the measured overflow point of a 2MB-stack debug build.
+const MAX_EXPR_DEPTH: usize = 500;
+
+thread_local! {
+    /// Depth consumed so far by the expression currently being built.
+    static EXPR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Holds `n` units of depth budget until dropped.
+struct DepthGuard(usize);
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        EXPR_DEPTH.with(|d| d.set(d.get().saturating_sub(self.0)));
+    }
+}
+
+/// Charges `n` levels to the running total; rejects before the tree is built.
+fn charge(n: usize) -> Result<DepthGuard> {
+    let guard = DepthGuard(n);
+    // Registered first so the charge is released even when rejecting.
+    let total = EXPR_DEPTH.with(|d| {
+        d.set(d.get() + n);
+        d.get()
+    });
+    if total >= MAX_EXPR_DEPTH {
+        return Err(too_deep());
+    }
+    Ok(guard)
+}
 
 fn too_deep() -> anyhow::Error {
     anyhow!("SQL is too deeply nested (max depth {MAX_NEST_DEPTH} for parentheses/NOT/-, {MAX_EXPR_DEPTH} for expressions)")
-}
-
-/// Depth of an expression tree, computed without recursion.
-fn expr_depth(e: &Expr) -> usize {
-    let (mut max, mut stack) = (0, vec![(e, 1usize)]);
-    while let Some((e, d)) = stack.pop() {
-        max = max.max(d);
-        match e {
-            Expr::BinOp { left, right, .. } => {
-                stack.push((left, d + 1));
-                stack.push((right, d + 1));
-            }
-            Expr::Unary { expr, .. } | Expr::Agg { expr, .. } => stack.push((expr, d + 1)),
-            _ => {}
-        }
-    }
-    max
 }
 
 /// Rejects oversized or deeply nested input before the recursive parser runs,
@@ -110,34 +123,14 @@ pub fn parse(sql: &str) -> Result<SelectStmt> {
         .find(|p| p.as_rule() == Rule::select_stmt)
         .ok_or_else(|| anyhow!("no select_stmt found"))?;
 
-    let stmt = parse_select_stmt(select_stmt)?;
-    check_depth(&stmt)?;
-    Ok(stmt)
+    EXPR_DEPTH.with(|d| d.set(0));
+    parse_select_stmt(select_stmt)
 }
 
-fn check_depth(stmt: &SelectStmt) -> Result<()> {
-    let exprs = stmt
-        .select
-        .iter()
-        .filter_map(|i| match i {
-            SelectItem::Expr(e, _) => Some(e),
-            SelectItem::Wildcard => None,
-        })
-        .chain(stmt.where_.iter())
-        .chain(stmt.joins.iter().map(|j| &j.on));
-    if exprs.into_iter().any(|e| expr_depth(e) > MAX_EXPR_DEPTH) {
-        return Err(too_deep());
-    }
-    Ok(())
-}
-
-/// Number of operands in a flat operator chain; rejects before the left-deep
-/// tree is built so even dropping it cannot overflow the stack.
-fn chain_guard(n: usize) -> Result<()> {
-    if n > MAX_EXPR_DEPTH {
-        return Err(too_deep());
-    }
-    Ok(())
+/// Depth charged for a flat chain of `n` operands (`n - 1` operators); the
+/// same for every operator, so the boundary is the same number of terms.
+fn chain_guard(n: usize) -> Result<DepthGuard> {
+    charge(n.saturating_sub(1))
 }
 
 fn parse_select_stmt(pair: Pair<Rule>) -> Result<SelectStmt> {
@@ -307,7 +300,7 @@ fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_or_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
-    chain_guard(children.len())?;
+    let _g = chain_guard(children.len())?;
     let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty or_expr"))?)?;
     for right_pair in children {
         let right = parse_expr(right_pair)?;
@@ -322,7 +315,7 @@ fn parse_or_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_and_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
-    chain_guard(children.len())?;
+    let _g = chain_guard(children.len())?;
     let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty and_expr"))?)?;
     for right_pair in children {
         let right = parse_expr(right_pair)?;
@@ -341,6 +334,7 @@ fn parse_not_expr(pair: Pair<Rule>) -> Result<Expr> {
     match first.as_rule() {
         Rule::not_expr => {
             // NOT <not_expr>
+            let _g = charge(1)?;
             Ok(Expr::Unary {
                 op: UnaryOp::Not,
                 expr: Box::new(parse_expr(first)?),
@@ -368,6 +362,7 @@ fn parse_cmp_expr(pair: Pair<Rule>) -> Result<Expr> {
             ">=" => BinOp::Ge,
             s => return Err(anyhow!("unknown cmp_op: {}", s)),
         };
+        let _g = charge(1)?;
         let right = parse_expr(
             children
                 .next()
@@ -385,7 +380,7 @@ fn parse_cmp_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_add_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
-    chain_guard(children.len() / 2)?;
+    let _g = chain_guard(children.len() / 2 + 1)?;
     let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty add_expr"))?)?;
 
     while let Some(op_pair) = children.next() {
@@ -410,7 +405,7 @@ fn parse_add_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_mul_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
-    chain_guard(children.len() / 2)?;
+    let _g = chain_guard(children.len() / 2 + 1)?;
     let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty mul_expr"))?)?;
 
     while let Some(op_pair) = children.next() {
@@ -440,6 +435,7 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr> {
         let inner = children
             .next()
             .ok_or_else(|| anyhow!("missing unary_expr operand"))?;
+        let _g = charge(1)?;
         Ok(Expr::Unary {
             op: UnaryOp::Neg,
             expr: Box::new(parse_expr(inner)?),
@@ -455,7 +451,10 @@ fn parse_primary(pair: Pair<Rule>) -> Result<Expr> {
         .next()
         .ok_or_else(|| anyhow!("empty primary"))?;
     match inner.as_rule() {
-        Rule::expr => parse_expr(inner),
+        Rule::expr => {
+            let _g = charge(1)?;
+            parse_expr(inner)
+        }
         Rule::func_call => parse_func_call(inner),
         Rule::literal => parse_literal_expr(inner),
         Rule::column_ref => Ok(Expr::Column(super::nfc(inner.as_str()))),
@@ -487,7 +486,10 @@ fn parse_func_call(pair: Pair<Rule>) -> Result<Expr> {
 
     let arg_expr = match arg_inner.as_rule() {
         Rule::star_arg => Expr::Wildcard,
-        _ => parse_expr(arg_inner)?,
+        _ => {
+            let _g = charge(1)?;
+            parse_expr(arg_inner)?
+        }
     };
 
     Ok(Expr::Agg {
@@ -1181,7 +1183,7 @@ mod tests {
 
     #[test]
     fn moderate_binop_chain_still_parses() {
-        nested_ok(&format!("SELECT 1{} AS s FROM a", "+1".repeat(500)));
+        nested_ok(&format!("SELECT 1{} AS s FROM a", "+1".repeat(400)));
     }
 
     #[test]
@@ -1195,5 +1197,73 @@ mod tests {
             "SELECT * FROM t WHERE a = {}1",
             "-\u{3000}".repeat(200)
         ));
+    }
+
+    /// Runs `f` on a 2MB stack, the smallest default thread stack in use.
+    fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .expect("overflowed or panicked on a 2MB stack");
+    }
+
+    #[test]
+    fn nested_parens_and_chains_accumulate_depth() {
+        // 40 parens x 20 terms: each level is under its own limit, but the
+        // tree is ~800 deep (#138).
+        let mut e = String::from("1");
+        for _ in 0..40 {
+            e = format!("({e}{})", "+1".repeat(19));
+        }
+        assert_too_deep(&format!("SELECT {e} AS s FROM a"));
+    }
+
+    #[test]
+    fn chain_boundary_is_same_for_all_operators() {
+        let ok = |sql: String| {
+            parse(&sql).unwrap();
+        };
+        for op in ["+", "-", "*", "/"] {
+            ok(format!(
+                "SELECT 1{} AS s FROM a",
+                format!("{op}1").repeat(499)
+            ));
+            assert_too_deep(&format!(
+                "SELECT 1{} AS s FROM a",
+                format!("{op}1").repeat(500)
+            ));
+        }
+        for op in ["AND", "OR"] {
+            ok(format!(
+                "SELECT * FROM a WHERE x{}",
+                format!(" {op} x").repeat(499)
+            ));
+            assert_too_deep(&format!(
+                "SELECT * FROM a WHERE x{}",
+                format!(" {op} x").repeat(500)
+            ));
+        }
+    }
+
+    #[test]
+    fn deep_trees_do_not_overflow_a_2mb_stack() {
+        on_small_stack(|| {
+            let mut cases = vec![
+                format!("SELECT 1{} AS s FROM a", "+1".repeat(499)),
+                format!("SELECT * FROM a WHERE x{}", " AND x".repeat(499)),
+            ];
+            for k in [10, 30, 100] {
+                let mut e = String::from("1");
+                for _ in 0..k {
+                    e = format!("({e}{})", "+1".repeat(1000 / k));
+                }
+                cases.push(format!("SELECT {e} AS s FROM a"));
+            }
+            for sql in cases {
+                let _ = parse(&sql); // Ok or Err, but must not abort (incl. Drop)
+            }
+        });
     }
 }
