@@ -1171,3 +1171,35 @@ fn test_order_by_expr_alias_keeps_every_output_column() -> Result<()> {
     assert_eq!(rows[0], ["104", "-7"]);
     Ok(())
 }
+
+// ── #131: 0 行でも存在しない列は検出する ──
+
+#[test]
+fn test_missing_projection_column_errors_with_zero_rows() {
+    let err = run_query(
+        &sample_csv(),
+        "SELECT nope FROM data WHERE price > 100000000",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("nope"), "{err}");
+}
+
+#[test]
+fn test_missing_order_by_column_errors_with_zero_rows() {
+    let err = run_query(
+        &sample_csv(),
+        "SELECT * FROM data WHERE price > 100000000 ORDER BY zzz",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("zzz"), "{err}");
+}
+
+#[test]
+fn test_missing_count_column_errors_with_zero_rows() {
+    let err = run_query(
+        &sample_csv(),
+        "SELECT COUNT(nope) FROM data WHERE price > 100000000",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("nope"), "{err}");
+}
