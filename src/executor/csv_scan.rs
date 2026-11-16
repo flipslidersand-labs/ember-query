@@ -10,7 +10,7 @@ use crate::catalog::TableSchema;
 const BATCH_SIZE: usize = 1024;
 
 pub struct CsvScanExec {
-    reader: csv::Reader<std::fs::File>,
+    reader: csv::Reader<crate::catalog::BoundedRead<std::fs::File>>,
     schema: SchemaRef,
     done: bool,
     line_offset: u64,
@@ -31,10 +31,8 @@ impl CsvScanExec {
     /// Tag each column with `table` (the FROM/JOIN alias or name, not the
     /// file name) so `t.col` resolves exactly after a JOIN (#40, #92).
     pub fn with_table(path: &str, table_schema: TableSchema, table: &str) -> Result<Self> {
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .flexible(true) // short records pad with NULL; long ones are rejected in next()
-            .from_path(path)
+        // flexible: short records pad with NULL; long ones are rejected in next()
+        let mut reader = crate::catalog::open_reader(std::path::Path::new(path))
             .map_err(|e| anyhow!("cannot open CSV '{}': {}", path, e))?;
 
         reader
