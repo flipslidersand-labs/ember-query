@@ -347,4 +347,75 @@ mod tests {
         assert!(exec.next().is_err());
         assert!(exec.next().unwrap().is_none(), "no retry after an error");
     }
+
+    /// 左 n 行 (キー 1..=n, 各 1 件マッチ) x 右 (キー 1..=n)。
+    fn unique_key_join(n: i64) -> Vec<RecordBatch> {
+        let keys: Vec<i64> = (1..=n).collect();
+        let l = kv_batch(Arc::new(Int64Array::from(keys.clone())), keys.clone());
+        let r = kv_batch(Arc::new(Int64Array::from(keys.clone())), keys);
+        run_join(vec![l], vec![r])
+    }
+
+    #[test]
+    fn output_of_exactly_one_full_batch_has_no_trailing_batch() {
+        let out = unique_key_join(8192);
+        assert_eq!(out.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), [8192]);
+    }
+
+    #[test]
+    fn output_one_row_over_the_limit_spills_into_a_second_batch() {
+        let out = unique_key_join(8193);
+        assert_eq!(
+            out.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            [8192, 1]
+        );
+        let lv: Vec<i64> = out.iter().flat_map(|b| i64_col(b, "v")).collect();
+        assert_eq!(lv, (1..=8193).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn resumes_correctly_across_left_batches() {
+        // 左 2 バッチ。1 つ目の途中 (行の途中) で出力が満杯になり、続きから再開する。
+        let l1 = kv_batch(Arc::new(Int64Array::from(vec![1, 2])), vec![10, 20]);
+        let l2 = kv_batch(Arc::new(Int64Array::from(vec![2, 3])), vec![30, 40]);
+        let rv: Vec<i64> = (0..5000).collect();
+        let mut rk = vec![1; 5000];
+        rk.extend(vec![2; 5000]);
+        rk.push(3);
+        let mut rvals = rv.clone();
+        rvals.extend(rv.clone());
+        rvals.push(0);
+        let r = kv_batch(Arc::new(Int64Array::from(rk)), rvals);
+        let out = run_join(vec![l1, l2], vec![r]);
+        assert!(out.iter().all(|b| b.num_rows() <= 8192));
+        // 5000 + 5000 (l1) + 5000 (l2 key 2) + 1 (l2 key 3)
+        assert_eq!(rows(&out), 15001);
+        let lv: Vec<i64> = out.iter().flat_map(|b| i64_col(b, "v")).collect();
+        let mut exp: Vec<i64> = vec![10; 5000];
+        exp.extend(vec![20; 5000]);
+        exp.extend(vec![30; 5000]);
+        exp.push(40);
+        assert_eq!(lv, exp);
+    }
+
+    #[test]
+    fn empty_right_input_yields_no_rows() {
+        let l = kv_batch(Arc::new(Int64Array::from(vec![1, 2])), vec![1, 2]);
+        let empty = kv_batch(Arc::new(Int64Array::from(Vec::<i64>::new())), vec![]);
+        assert_eq!(rows(&run_join(vec![l.clone()], vec![empty.clone()])), 0);
+
+        // 右が 0 バッチ (空のストリーム) でも同様。
+        let on = Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Column("k".into())),
+            right: Box::new(Expr::Column("k".into())),
+        };
+        let mut exec = HashJoinExec::new(
+            Box::new(VecExec::new(l.schema(), vec![l])),
+            Box::new(VecExec::new(empty.schema(), vec![])),
+            &on,
+        )
+        .unwrap();
+        assert!(exec.next().unwrap().is_none());
+    }
 }
