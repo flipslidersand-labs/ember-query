@@ -38,6 +38,8 @@ struct AggState {
     count: i64,
     sum_i: i64,
     sum_f: f64,
+    /// Int64 の AVG 用。f64 で足すと 2^53 超で桁が落ちるので i128 で厳密に足す
+    avg_i: i128,
     min: Option<Val>,
     max: Option<Val>,
 }
@@ -48,6 +50,7 @@ impl AggState {
             count: 0,
             sum_i: 0,
             sum_f: 0.0,
+            avg_i: 0,
             min: None,
             max: None,
         }
@@ -316,7 +319,7 @@ fn update_value(st: &mut AggState, func: &AggFunc, arr: &ArrayRef, row: usize) -
                 .ok_or_else(|| anyhow!("integer overflow in SUM"))?;
         }
         (AggFunc::Sum | AggFunc::Avg, Val::Float(f)) => st.sum_f += f,
-        (AggFunc::Avg, Val::Int(i)) => st.sum_f += i as f64,
+        (AggFunc::Avg, Val::Int(i)) => st.avg_i += i as i128,
         (AggFunc::Min | AggFunc::Max, v) => st.update_minmax(v),
         _ => {
             return Err(anyhow!(
@@ -408,7 +411,7 @@ fn build_agg_column(
         match func {
             AggFunc::Sum if dt == &DataType::Int64 => Some(Val::Int(s.sum_i)),
             AggFunc::Sum => Some(Val::Float(s.sum_f)),
-            AggFunc::Avg => Some(Val::Float(s.sum_f / s.count as f64)),
+            AggFunc::Avg => Some(Val::Float((s.avg_i as f64 + s.sum_f) / s.count as f64)),
             AggFunc::Min => s.min.clone(),
             _ => s.max.clone(),
         }
@@ -807,6 +810,23 @@ mod tests {
         HashAggExec::new(make_exec(cols, false), vec![], aggs)?
             .next()
             .map(|b| b.unwrap())
+    }
+
+    #[test]
+    fn int64_avg_is_exact_above_2_pow_53() {
+        // 2^53 + 1 - 2^53 の桁落ちを起こさない: (2^53 + 1 - 2^53) / 3 = 1/3
+        let big = 1i64 << 53;
+        let out = run_agg(
+            vec![Some(big), Some(1), Some(-big)],
+            vec![(AggFunc::Avg, col("v"), "a".into())],
+        );
+        let a = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<F64>()
+            .unwrap()
+            .value(0);
+        assert!((a - 1.0 / 3.0).abs() < 1e-12, "{a}");
     }
 
     #[test]
