@@ -7,13 +7,27 @@ pub(crate) const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 /// 列数の上限。
 pub(crate) const MAX_COLUMNS: usize = 10_000;
 
+/// `BoundedRead` が追う、csv クレートと同じ規則の簡易クォート状態。
+#[derive(Clone, Copy, PartialEq)]
+enum QState {
+    /// 欄頭(行頭または `,` の直後)。ここでの `"` だけがクォートを開く。
+    FieldStart,
+    /// 未クォート欄の途中。`"` は普通の文字。
+    Unquoted,
+    /// クォート欄の中。
+    Quoted,
+    /// クォート欄の中で `"` を 1 つ読んだ直後(`""` なら継続、他なら閉じ)。
+    QuoteSeen,
+}
+
 /// 1 レコードのバイト数を `limit` までに制限する Read ラッパ。レコード境界は
-/// クォート外の `\n`(`"` の偶奇で判定)。超えたら `InvalidData` を返し、
-/// csv クレートが巨大な 1 レコードをバッファする前に打ち切る。
+/// クォート外の `\n` / `\r`(csv と同じく欄頭の `"` でだけクォートが開く)。
+/// 超えたら `InvalidData` を返し、csv クレートが巨大な 1 レコードを
+/// バッファする前に打ち切る。
 pub(crate) struct BoundedRead<R> {
     inner: R,
     limit: usize,
-    in_quote: bool,
+    state: QState,
     run: usize,
 }
 
@@ -21,13 +35,20 @@ impl<R: std::io::Read> std::io::Read for BoundedRead<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         for &b in &buf[..n] {
-            match b {
-                b'"' => self.in_quote = !self.in_quote,
-                b'\n' if !self.in_quote => {
-                    self.run = 0;
-                    continue;
-                }
-                _ => {}
+            use QState::*;
+            let (next, boundary) = match (self.state, b) {
+                (FieldStart, b'"') => (Quoted, false),
+                (Quoted, b'"') => (QuoteSeen, false),
+                (Quoted, _) => (Quoted, false),
+                (QuoteSeen, b'"') => (Quoted, false),
+                (_, b'\n' | b'\r') => (FieldStart, true),
+                (_, b',') => (FieldStart, false),
+                _ => (Unquoted, false),
+            };
+            self.state = next;
+            if boundary {
+                self.run = 0;
+                continue;
             }
             self.run += 1;
             if self.run > self.limit {
@@ -43,14 +64,21 @@ impl<R: std::io::Read> std::io::Read for BoundedRead<R> {
 
 /// 入力 CSV を開く(1 レコードのサイズ上限つき)。infer と scan で共通。
 pub(crate) fn open_reader(path: &Path) -> std::io::Result<csv::Reader<BoundedRead<std::fs::File>>> {
+    open_reader_with_limit(path, MAX_RECORD_BYTES)
+}
+
+pub(crate) fn open_reader_with_limit(
+    path: &Path,
+    limit: usize,
+) -> std::io::Result<csv::Reader<BoundedRead<std::fs::File>>> {
     let file = std::fs::File::open(path)?;
     Ok(csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
         .from_reader(BoundedRead {
             inner: file,
-            limit: MAX_RECORD_BYTES,
-            in_quote: false,
+            limit,
+            state: QState::FieldStart,
             run: 0,
         }))
 }
@@ -445,6 +473,37 @@ mod tests {
         let f = TmpCsv::new(&format!("{header}\n"));
         let err = infer_schema(&f.0).unwrap_err().to_string();
         assert!(err.contains("columns"), "{err}");
+    }
+
+    fn count_records(content: &str, limit: usize) -> Result<usize> {
+        let f = TmpCsv::new(content);
+        let mut r = open_reader_with_limit(&f.0, limit)?;
+        let mut n = 0;
+        for rec in r.records() {
+            rec?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn stray_quote_in_unquoted_field_does_not_open_quote() {
+        // 欄途中の `"` はクォートを開かない(csv クレートと同じ)。全体が上限超でも読める。
+        let body = format!("a,b\n5\" pipe,1\n{}", "1,2\n".repeat(100));
+        assert_eq!(count_records(&body, 100).unwrap(), 101);
+    }
+
+    #[test]
+    fn quoted_field_with_escaped_quote_and_newline_is_one_record() {
+        let body = "a,b\n\"x\"\"\ny\",1\n1,2\n1,2\n1,2\n1,2\n";
+        assert_eq!(count_records(body, 12).unwrap(), 5);
+    }
+
+    #[test]
+    fn record_limit_boundary_is_exact() {
+        // "a\n" の後、改行を除いてちょうど limit バイトの行は可、+1 はエラー。
+        assert_eq!(count_records("a\n12345678\n", 8).unwrap(), 1);
+        assert!(count_records("a\n123456789\n", 8).is_err());
     }
 
     #[test]
