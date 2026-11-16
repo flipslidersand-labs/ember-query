@@ -265,4 +265,46 @@ mod tests {
         assert_eq!(i64_col(&out[1], "v"), vec![30, 30, 30]);
         assert_eq!(i64_col(&out[1], "right_v"), vec![100, 101, 102]);
     }
+
+    // ── #133: 結果は逐次(バッチ単位)に生成する ─────────────────────────
+
+    #[test]
+    fn duplicate_keys_first_next_builds_only_one_bounded_batch() {
+        // 全行 k=1 の 1000 x 1000 (全結果は 100 万行)。next() 1 回で全件を作らない。
+        let n = 1000;
+        let l = kv_batch(Arc::new(Int64Array::from(vec![1; n])), vec![0; n]);
+        let r = kv_batch(Arc::new(Int64Array::from(vec![1; n])), vec![0; n]);
+        let on = Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Column("k".into())),
+            right: Box::new(Expr::Column("k".into())),
+        };
+        let (ls, rs) = (l.schema(), r.schema());
+        let mut exec = HashJoinExec::new(
+            Box::new(VecExec::new(ls, vec![l])),
+            Box::new(VecExec::new(rs, vec![r])),
+            &on,
+        )
+        .unwrap();
+        let first = exec.next().unwrap().unwrap();
+        assert!(first.num_rows() > 0 && first.num_rows() <= 8192);
+    }
+
+    #[test]
+    fn large_fanout_is_split_into_batches_preserving_order() {
+        // 左 3 行 x 右 5000 行 (同一キー) = 15000 行。分割しても順序・総数は同じ。
+        let l = kv_batch(Arc::new(Int64Array::from(vec![1, 1, 1])), vec![1, 2, 3]);
+        let rv: Vec<i64> = (0..5000).collect();
+        let r = kv_batch(Arc::new(Int64Array::from(vec![1; 5000])), rv.clone());
+        let out = run_join(vec![l], vec![r]);
+        assert!(out.len() > 1);
+        assert!(out.iter().all(|b| b.num_rows() <= 8192));
+        assert_eq!(rows(&out), 15000);
+        let lv: Vec<i64> = out.iter().flat_map(|b| i64_col(b, "v")).collect();
+        let rr: Vec<i64> = out.iter().flat_map(|b| i64_col(b, "right_v")).collect();
+        let exp_l: Vec<i64> = (1..=3).flat_map(|x| vec![x; 5000]).collect();
+        let exp_r: Vec<i64> = (0..3).flat_map(|_| rv.clone()).collect();
+        assert_eq!(lv, exp_l);
+        assert_eq!(rr, exp_r);
+    }
 }

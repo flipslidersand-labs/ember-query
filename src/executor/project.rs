@@ -42,6 +42,17 @@ impl ProjectExec {
             }
         }
 
+        // 0 行入力でも存在しない列・型エラーを検出するため、空バッチで式を検証する。
+        // 集約を含む式は ProjectExec では評価できないので対象外。
+        let empty = RecordBatch::new_empty(in_schema.clone());
+        for (_, proj) in &projections {
+            if let Proj::Expr(expr) = proj {
+                if !crate::planner::logical::contains_agg(expr) {
+                    evaluate(&empty, expr)?;
+                }
+            }
+        }
+
         // Build output schema
         let fields: Vec<Field> = projections
             .iter()

@@ -22,6 +22,12 @@ impl SortExec {
             all_batches.push(rb);
         }
 
+        // 入力が 0 行でも存在しない ORDER BY 列は検出する
+        for ob in &order_by {
+            resolve_column(&schema, &ob.column)
+                .map_err(|e| anyhow!("ORDER BY column '{}': {}", ob.column, e))?;
+        }
+
         if all_batches.is_empty() {
             return Ok(SortExec {
                 schema,
