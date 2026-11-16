@@ -507,6 +507,64 @@ mod tests {
     }
 
     #[test]
+    fn stray_quote_in_header_does_not_let_next_record_escape_limit() {
+        // 見出し `a"` の `"` は普通の文字。次レコード頭の `"` はクォートを開き、
+        // 閉じないまま続くので上限超過でエラーになる(上限回避にならない)。
+        let body = format!("a\"\n\"{}", "x\n".repeat(100));
+        assert!(count_records(&body, 20).is_err());
+    }
+
+    #[test]
+    fn lone_cr_is_record_boundary() {
+        // 単独 CR でも run が 0 に戻る。上限ちょうどの記録が CR 区切りで続いても通る。
+        assert_eq!(
+            count_records("a\r12345678\r12345678\r12345678", 8).unwrap(),
+            3
+        );
+        assert!(count_records("a\r12345678\r123456789\r1", 8).is_err());
+    }
+
+    /// 1 回の read で 1 バイトしか返さない Read ラッパ。
+    struct OneByte<R>(R);
+
+    impl<R: std::io::Read> std::io::Read for OneByte<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(1);
+            self.0.read(&mut buf[..n])
+        }
+    }
+
+    fn count_records_one_byte(content: &str, limit: usize) -> Result<usize> {
+        let inner = OneByte(std::io::Cursor::new(content.as_bytes().to_vec()));
+        let mut r = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_reader(BoundedRead {
+                inner,
+                limit,
+                state: QState::FieldStart,
+                run: 0,
+            });
+        let mut n = 0;
+        for rec in r.records() {
+            rec?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn escaped_quote_across_read_boundary_continues_quote() {
+        // `""` が read 境界で分かれても、クォートは継続する。
+        // 継続するので、クォート内の改行は境界にならず上限超過になる。
+        let long = format!("a\n\"x\"\"{}\"\n", "y\n".repeat(20));
+        assert!(count_records_one_byte(&long, 10).is_err());
+        // 上限内なら 1 レコード(クォート内改行を含む)として通る。
+        let ok = "a\n\"x\"\"\ny\"\n1\n";
+        assert_eq!(count_records_one_byte(ok, 7).unwrap(), 2);
+    }
+
+    #[test]
     fn nonexistent_file_is_error() {
         assert!(infer_schema(Path::new("/nonexistent/ember_query/nope.csv")).is_err());
     }
