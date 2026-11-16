@@ -299,33 +299,11 @@ fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_or_expr(pair: Pair<Rule>) -> Result<Expr> {
-    let mut children = pair.into_inner();
-    let _g = chain_guard(children.len())?;
-    let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty or_expr"))?)?;
-    for right_pair in children {
-        let right = parse_expr(right_pair)?;
-        left = Expr::BinOp {
-            op: BinOp::Or,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
-    }
-    Ok(left)
+    fold_binop(pair, "or", false, |_| Ok(BinOp::Or))
 }
 
 fn parse_and_expr(pair: Pair<Rule>) -> Result<Expr> {
-    let mut children = pair.into_inner();
-    let _g = chain_guard(children.len())?;
-    let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty and_expr"))?)?;
-    for right_pair in children {
-        let right = parse_expr(right_pair)?;
-        left = Expr::BinOp {
-            op: BinOp::And,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
-    }
-    Ok(left)
+    fold_binop(pair, "and", false, |_| Ok(BinOp::And))
 }
 
 fn parse_not_expr(pair: Pair<Rule>) -> Result<Expr> {
@@ -379,46 +357,54 @@ fn parse_cmp_expr(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_add_expr(pair: Pair<Rule>) -> Result<Expr> {
-    let mut children = pair.into_inner();
-    let _g = chain_guard(children.len() / 2 + 1)?;
-    let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty add_expr"))?)?;
-
-    while let Some(op_pair) = children.next() {
-        let op = match op_pair.as_str() {
-            "+" => BinOp::Add,
-            "-" => BinOp::Sub,
-            s => return Err(anyhow!("unknown add_op: {}", s)),
-        };
-        let right = parse_expr(
-            children
-                .next()
-                .ok_or_else(|| anyhow!("missing add_expr rhs"))?,
-        )?;
-        left = Expr::BinOp {
-            op,
-            left: Box::new(left),
-            right: Box::new(right),
-        };
-    }
-    Ok(left)
+    fold_binop(pair, "add", true, |s| match s {
+        "+" => Ok(BinOp::Add),
+        "-" => Ok(BinOp::Sub),
+        s => Err(anyhow!("unknown add_op: {}", s)),
+    })
 }
 
 fn parse_mul_expr(pair: Pair<Rule>) -> Result<Expr> {
-    let mut children = pair.into_inner();
-    let _g = chain_guard(children.len() / 2 + 1)?;
-    let mut left = parse_expr(children.next().ok_or_else(|| anyhow!("empty mul_expr"))?)?;
+    fold_binop(pair, "mul", true, |s| match s {
+        "*" => Ok(BinOp::Mul),
+        "/" => Ok(BinOp::Div),
+        s => Err(anyhow!("unknown mul_op: {}", s)),
+    })
+}
 
-    while let Some(op_pair) = children.next() {
-        let op = match op_pair.as_str() {
-            "*" => BinOp::Mul,
-            "/" => BinOp::Div,
-            s => return Err(anyhow!("unknown mul_op: {}", s)),
-        };
-        let right = parse_expr(
-            children
+/// Left-associative fold of a flat `<name>_expr` chain. With `has_op_tokens`
+/// the children alternate operand/operator (`op_of` maps the operator text);
+/// otherwise every child is an operand and `op_of` gets an empty string.
+/// The depth guard is charged once, before any operand is parsed.
+fn fold_binop(
+    pair: Pair<Rule>,
+    name: &str,
+    has_op_tokens: bool,
+    op_of: impl Fn(&str) -> Result<BinOp>,
+) -> Result<Expr> {
+    let mut children = pair.into_inner();
+    let operands = if has_op_tokens {
+        children.len() / 2 + 1
+    } else {
+        children.len()
+    };
+    let _g = chain_guard(operands)?;
+    let mut left = parse_expr(
+        children
+            .next()
+            .ok_or_else(|| anyhow!("empty {}_expr", name))?,
+    )?;
+    while let Some(next) = children.next() {
+        let (op, right_pair) = if has_op_tokens {
+            let op = op_of(next.as_str())?;
+            let rhs = children
                 .next()
-                .ok_or_else(|| anyhow!("missing mul_expr rhs"))?,
-        )?;
+                .ok_or_else(|| anyhow!("missing {}_expr rhs", name))?;
+            (op, rhs)
+        } else {
+            (op_of("")?, next)
+        };
+        let right = parse_expr(right_pair)?;
         left = Expr::BinOp {
             op,
             left: Box::new(left),
