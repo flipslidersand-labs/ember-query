@@ -35,7 +35,15 @@ fn normalization_variant(dir: &Path, table: &str) -> Option<String> {
     })
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        // 入力 CSV 由来の値がエラー文に入りうるため、制御文字は無害化して出す。
+        eprintln!("Error: {}", display::escape_control(&format!("{e:#}")));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // 1. Infer schema from CSV
@@ -82,7 +90,9 @@ fn main() -> Result<()> {
     let logical_plan = planner::build(&stmt, path, schema, &cat)?;
 
     if cli.explain {
-        println!("Logical Plan:\n{}", logical_plan.explain(0));
+        let plan = logical_plan.explain(0);
+        let plan: Vec<String> = plan.split('\n').map(display::escape_control).collect();
+        println!("Logical Plan:\n{}", plan.join("\n"));
         return Ok(());
     }
 

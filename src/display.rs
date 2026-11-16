@@ -3,6 +3,26 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use unicode_width::UnicodeWidthStr;
 
+/// 端末へ出す文字列から制御文字(C0・DEL・C1。ESC・改行・タブ・CR を含む)を除き、
+/// `\x1b` / `\u{85}` / `\n` 形式の可視表記にする。表の 1 セルを 1 行に保つため
+/// 改行・タブも例外にしない。バックスラッシュ自体は変換しない。
+pub fn escape_control(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x80 && c.is_control() => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Pretty-print batches as one aligned ASCII table on stdout.
 pub fn print_batch(batches: &[RecordBatch]) {
     print!("{}", format_batch(batches));
@@ -18,6 +38,11 @@ pub fn format_batch(batches: &[RecordBatch]) -> String {
     };
     let schema = first.schema();
     let n_cols = first.num_columns();
+    let names: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| escape_control(f.name()))
+        .collect();
 
     // Stringify every cell, column-major, across all batches.
     let mut col_data: Vec<Vec<String>> = vec![Vec::new(); n_cols];
@@ -32,7 +57,7 @@ pub fn format_batch(batches: &[RecordBatch]) -> String {
     let col_widths: Vec<usize> = (0..n_cols)
         .map(|i| {
             let max_val = col_data[i].iter().map(|s| s.width()).max().unwrap_or(0);
-            schema.field(i).name().width().max(max_val)
+            names[i].width().max(max_val)
         })
         .collect();
 
@@ -45,9 +70,7 @@ pub fn format_batch(batches: &[RecordBatch]) -> String {
     };
 
     let mut out = String::new();
-    out.push_str(&pad_line(
-        &mut schema.fields().iter().map(|f| f.name().as_str()),
-    ));
+    out.push_str(&pad_line(&mut names.iter().map(|n| n.as_str())));
     out.push('\n');
     out.push_str(
         &col_widths
@@ -84,7 +107,7 @@ fn format_value(arr: &dyn Array, row: usize, dt: &DataType) -> String {
         }
         DataType::Utf8 => {
             let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
-            a.value(row).to_string()
+            escape_control(a.value(row))
         }
         _ => format!("<{:?}>", dt),
     }
@@ -224,5 +247,38 @@ mod tests {
         assert_eq!(lines[2], "e\u{301} ");
         assert_eq!(lines[3], "😀");
         assert_eq!(lines[4], "ab");
+    }
+
+    fn utf8_batch(name: &str, val: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![val])) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn escape_control_covers_c0_del_c1() {
+        assert_eq!(escape_control("a\x1bb"), "a\\x1bb");
+        assert_eq!(escape_control("\x07\x00\x7f"), "\\x07\\x00\\x7f");
+        assert_eq!(escape_control("\n\r\t"), "\\n\\r\\t");
+        assert_eq!(escape_control("\u{85}\u{9b}"), "\\u{85}\\u{9b}");
+        assert_eq!(escape_control("日本語 ok\\"), "日本語 ok\\");
+    }
+
+    #[test]
+    fn cells_and_headers_with_escape_sequences_are_neutralized() {
+        let out = format_batch(&[utf8_batch("h\x1b[2J", "\x1b]0;pwned\x07\x1b[31mRED")]);
+        assert!(!out.contains('\x1b') && !out.contains('\x07'), "{out:?}");
+        assert!(out.contains("\\x1b]0;pwned\\x07\\x1b[31mRED"), "{out:?}");
+        assert!(out.contains("h\\x1b[2J"), "{out:?}");
+    }
+
+    #[test]
+    fn newline_in_cell_keeps_one_line_per_row() {
+        let out = format_batch(&[utf8_batch("s", "a\nb\tc")]);
+        assert_eq!(out.lines().count(), 3, "{out:?}");
+        assert!(out.contains("a\\nb\\tc"), "{out:?}");
     }
 }
