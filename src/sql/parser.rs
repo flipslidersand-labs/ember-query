@@ -18,7 +18,14 @@ const MAX_NEST_DEPTH: usize = 128;
 /// (`1+1+...`), comparisons, `NOT`, unary minus, aggregates and parentheses
 /// together. Left-deep chains recurse in `evaluate` and in the AST's `Drop`, so
 /// the sum along any nesting path is bounded, not each chain on its own (#138).
-/// The value is below the measured overflow point of a 2MB-stack debug build.
+///
+/// Measured overflow point (#149): the largest `a+1+...+1` / `AND` / `OR` chain
+/// that still parses and runs through `executor.next()` on a 2MB thread is about
+/// 795 terms in a `cargo test` debug build and about 796 in a `cargo llvm-cov`
+/// instrumented build. 500 therefore leaves only ~1.6x headroom, in both builds.
+/// Do not raise it; any change that grows the recursion frames must re-measure
+/// with `tests/deep_expr_stack_test.rs` (EMBER_PROBE_N=<terms>, MAX_EXPR_DEPTH
+/// temporarily lifted).
 const MAX_EXPR_DEPTH: usize = 500;
 
 thread_local! {
@@ -346,6 +353,12 @@ fn parse_not_expr(pair: Pair<Rule>) -> Result<Expr> {
 
 fn parse_cmp_expr(pair: Pair<Rule>) -> Result<Expr> {
     let mut children = pair.into_inner();
+    // Charge before parsing either side so both count the comparison level (#149).
+    let _g = if children.len() > 1 {
+        Some(charge(1)?)
+    } else {
+        None
+    };
     let left = parse_expr(
         children
             .next()
@@ -362,7 +375,6 @@ fn parse_cmp_expr(pair: Pair<Rule>) -> Result<Expr> {
             ">=" => BinOp::Ge,
             s => return Err(anyhow!("unknown cmp_op: {}", s)),
         };
-        let _g = charge(1)?;
         let right = parse_expr(
             children
                 .next()
@@ -1199,16 +1211,6 @@ mod tests {
         ));
     }
 
-    /// Runs `f` on a 2MB stack, the smallest default thread stack in use.
-    fn on_small_stack(f: impl FnOnce() + Send + 'static) {
-        std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn(f)
-            .unwrap()
-            .join()
-            .expect("overflowed or panicked on a 2MB stack");
-    }
-
     #[test]
     fn nested_parens_and_chains_accumulate_depth() {
         // 40 parens x 20 terms: each level is under its own limit, but the
@@ -1247,23 +1249,28 @@ mod tests {
         }
     }
 
+    /// Largest chain length `n` for which `build(n)` parses.
+    fn max_accepted(build: impl Fn(usize) -> String) -> usize {
+        (0..600)
+            .take_while(|&n| parse(&build(n)).is_ok())
+            .last()
+            .unwrap()
+    }
+
     #[test]
-    fn deep_trees_do_not_overflow_a_2mb_stack() {
-        on_small_stack(|| {
-            let mut cases = vec![
-                format!("SELECT 1{} AS s FROM a", "+1".repeat(499)),
-                format!("SELECT * FROM a WHERE x{}", " AND x".repeat(499)),
-            ];
-            for k in [10, 30, 100] {
-                let mut e = String::from("1");
-                for _ in 0..k {
-                    e = format!("({e}{})", "+1".repeat(1000 / k));
-                }
-                cases.push(format!("SELECT {e} AS s FROM a"));
-            }
-            for sql in cases {
-                let _ = parse(&sql); // Ok or Err, but must not abort (incl. Drop)
-            }
-        });
+    fn comparison_charges_both_sides_alike() {
+        // A chain on the left of `<` used to be one level cheaper than on the
+        // right, because the left was parsed before the comparison was charged.
+        let left = max_accepted(|n| format!("SELECT * FROM a WHERE (x{}) < 1", "+1".repeat(n)));
+        let right = max_accepted(|n| format!("SELECT * FROM a WHERE 1 < (x{})", "+1".repeat(n)));
+        assert_eq!(left, right);
+        // 1 (comparison) + 1 (parens) + n (chain) must stay below 500.
+        assert_eq!(left, 497);
+        assert_too_deep(&format!(
+            "SELECT * FROM a WHERE (x{}) < 1",
+            "+1".repeat(left + 1)
+        ));
+        // Without a comparison nothing is charged for it.
+        parse(&format!("SELECT * FROM a WHERE x{}", "+1".repeat(499))).unwrap();
     }
 }

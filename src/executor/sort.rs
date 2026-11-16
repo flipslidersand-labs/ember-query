@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-use arrow::datatypes::SchemaRef;
+use arrow::array::{Array, ArrayRef, UInt32Array};
+use arrow::compute::{concat_batches, take_record_batch, SortOptions};
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use arrow::row::{RowConverter, SortField};
 
 use super::{resolve_column, Executor};
 use crate::sql::ast::OrderByItem;
@@ -37,26 +39,6 @@ impl SortExec {
             });
         }
 
-        // Concatenate all batches into one for sorting
-        let cols: Vec<Vec<ArrayRef>> = (0..all_batches[0].num_columns())
-            .map(|ci| all_batches.iter().map(|b| b.column(ci).clone()).collect())
-            .collect();
-
-        let merged_columns: Vec<ArrayRef> = cols
-            .into_iter()
-            .map(|parts| {
-                let refs: Vec<&dyn Array> = parts.iter().map(|a| a.as_ref()).collect();
-                arrow::compute::concat(&refs).map_err(anyhow::Error::from)
-            })
-            .collect::<Result<_>>()?;
-
-        let merged = RecordBatch::try_new(schema.clone(), merged_columns)?;
-
-        // Sort: build index vector [(sort_key, original_row_idx)] and sort it
-        let n = merged.num_rows();
-        let mut indices: Vec<usize> = (0..n).collect();
-
-        // Find sort column indices
         let sort_cols: Vec<(usize, bool)> = order_by
             .iter()
             .map(|ob| {
@@ -66,34 +48,38 @@ impl SortExec {
             })
             .collect::<Result<_>>()?;
 
-        // sort_by cannot return Err, so keep the first error and surface it afterwards.
-        let mut sort_err: Option<anyhow::Error> = None;
-        indices.sort_by(|&a, &b| {
-            for &(col_idx, asc) in &sort_cols {
-                let arr = merged.column(col_idx);
-                match compare_rows(arr, a, b, asc) {
-                    Ok(std::cmp::Ordering::Equal) => {}
-                    Ok(ord) => return ord,
-                    Err(e) => {
-                        sort_err.get_or_insert(e);
-                        return std::cmp::Ordering::Equal;
-                    }
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-        if let Some(e) = sort_err {
-            return Err(e);
-        }
+        let merged = concat_batches(&schema, &all_batches)?;
 
-        // Reorder rows according to sorted indices
-        let sorted_columns: Vec<ArrayRef> = merged
-            .columns()
+        // Row format: byte-comparable keys with total float order; NULLS LAST for both directions.
+        let fields = sort_cols
             .iter()
-            .map(|col| take_rows(col, &indices))
-            .collect::<Result<_>>()?;
+            .map(|&(ci, asc)| {
+                let dt = merged.column(ci).data_type().clone();
+                if !matches!(
+                    dt,
+                    DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Boolean
+                ) {
+                    return Err(anyhow!("ORDER BY on column type {:?} is not supported", dt));
+                }
+                Ok(SortField::new_with_options(
+                    dt,
+                    SortOptions {
+                        descending: !asc,
+                        nulls_first: false,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let key_cols: Vec<ArrayRef> = sort_cols
+            .iter()
+            .map(|&(ci, _)| merged.column(ci).clone())
+            .collect();
+        let rows = RowConverter::new(fields)?.convert_columns(&key_cols)?;
 
-        let sorted = RecordBatch::try_new(schema.clone(), sorted_columns)?;
+        // Stable sort keeps input order for equal keys.
+        let mut indices: Vec<u32> = (0..merged.num_rows() as u32).collect();
+        indices.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
+        let sorted = take_record_batch(&merged, &UInt32Array::from(indices))?;
 
         Ok(SortExec {
             schema,
@@ -120,41 +106,10 @@ impl Executor for SortExec {
     }
 }
 
-/// Compare two rows of one column. NULLS LAST regardless of `asc`:
-/// direction applies only to non-null values.
-fn compare_rows(arr: &ArrayRef, a: usize, b: usize, asc: bool) -> Result<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-    match (arr.is_null(a), arr.is_null(b)) {
-        (true, true) => return Ok(Ordering::Equal),
-        (true, false) => return Ok(Ordering::Greater),
-        (false, true) => return Ok(Ordering::Less),
-        _ => {}
-    }
-    let ord = if let Some(x) = arr.as_any().downcast_ref::<Int64Array>() {
-        x.value(a).cmp(&x.value(b))
-    } else if let Some(x) = arr.as_any().downcast_ref::<Float64Array>() {
-        x.value(a).total_cmp(&x.value(b))
-    } else if let Some(x) = arr.as_any().downcast_ref::<StringArray>() {
-        x.value(a).cmp(x.value(b))
-    } else if let Some(x) = arr.as_any().downcast_ref::<BooleanArray>() {
-        x.value(a).cmp(&x.value(b))
-    } else {
-        return Err(anyhow!(
-            "ORDER BY on column type {:?} is not supported",
-            arr.data_type()
-        ));
-    };
-    Ok(if asc { ord } else { ord.reverse() })
-}
-
-fn take_rows(arr: &ArrayRef, indices: &[usize]) -> Result<ArrayRef> {
-    let take_indices: arrow::array::Int64Array = indices.iter().map(|&i| Some(i as i64)).collect();
-    Ok(arrow::compute::take(arr.as_ref(), &take_indices, None)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -345,6 +300,93 @@ mod tests {
         );
         let out = sorted(vec![b], vec![("price", true)]).unwrap();
         assert_eq!(ids(&out), vec![Some(3), Some(2), Some(4), Some(1)]);
+    }
+
+    #[test]
+    fn equal_keys_keep_input_order_across_batches() {
+        // 同値キーは入力順を保つ(ASC/DESC とも)。id が入力順の目印。
+        let b1 = batch(
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            vec![1.0, 2.0, 1.0, 2.0],
+            vec!["x", "x", "y", "y"],
+        );
+        let b2 = batch(
+            vec![Some(5), Some(6), Some(7), None],
+            vec![1.0, 2.0, 1.0, 2.0],
+            vec!["x", "x", "y", "y"],
+        );
+        let asc = sorted(vec![b1.clone(), b2.clone()], vec![("price", true)]).unwrap();
+        assert_eq!(
+            ids(&asc),
+            vec![
+                Some(1),
+                Some(3),
+                Some(5),
+                Some(7),
+                Some(2),
+                Some(4),
+                Some(6),
+                None
+            ]
+        );
+        let desc = sorted(vec![b1.clone(), b2.clone()], vec![("price", false)]).unwrap();
+        assert_eq!(
+            ids(&desc),
+            vec![
+                Some(2),
+                Some(4),
+                Some(6),
+                None,
+                Some(1),
+                Some(3),
+                Some(5),
+                Some(7)
+            ]
+        );
+        // 複数キー: price ASC, name DESC、残りは入力順
+        let multi = sorted(vec![b1, b2], vec![("price", true), ("name", false)]).unwrap();
+        assert_eq!(
+            ids(&multi),
+            vec![
+                Some(3),
+                Some(7),
+                Some(1),
+                Some(5),
+                Some(4),
+                None,
+                Some(2),
+                Some(6)
+            ]
+        );
+    }
+
+    #[test]
+    fn utf8_sorts_bytewise_both_directions() {
+        let b = batch(
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            vec![0.0; 4],
+            vec!["b", "B", "ab", "b"],
+        );
+        let asc = sorted(vec![b.clone()], vec![("name", true)]).unwrap();
+        assert_eq!(ids(&asc), vec![Some(2), Some(3), Some(1), Some(4)]);
+        let desc = sorted(vec![b], vec![("name", false)]).unwrap();
+        assert_eq!(ids(&desc), vec![Some(1), Some(4), Some(3), Some(2)]);
+    }
+
+    #[test]
+    fn float_negative_zero_orders_before_zero_and_nan_desc() {
+        let b = batch(
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+            vec![0.0, -0.0, f64::NAN, -1.0, -0.0],
+            vec!["a"; 5],
+        );
+        let asc = sorted(vec![b.clone()], vec![("price", true)]).unwrap();
+        assert_eq!(ids(&asc), vec![Some(4), Some(2), Some(5), Some(1), Some(3)]);
+        let desc = sorted(vec![b], vec![("price", false)]).unwrap();
+        assert_eq!(
+            ids(&desc),
+            vec![Some(3), Some(1), Some(2), Some(5), Some(4)]
+        );
     }
 
     #[test]
