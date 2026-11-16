@@ -307,4 +307,44 @@ mod tests {
         assert_eq!(lv, exp_l);
         assert_eq!(rr, exp_r);
     }
+
+    /// 1 回目の next() はエラー、以降は同じバッチを返す左入力。
+    struct FailOnceExec {
+        schema: Arc<Schema>,
+        batch: RecordBatch,
+        failed: bool,
+    }
+
+    impl Executor for FailOnceExec {
+        fn next(&mut self) -> anyhow::Result<Option<RecordBatch>> {
+            if !self.failed {
+                self.failed = true;
+                anyhow::bail!("left failed");
+            }
+            Ok(Some(self.batch.clone()))
+        }
+        fn schema(&self) -> Arc<Schema> {
+            self.schema.clone()
+        }
+    }
+
+    #[test]
+    fn next_after_left_error_stays_finished() {
+        let l = kv_batch(Arc::new(Int64Array::from(vec![1])), vec![1]);
+        let r = kv_batch(Arc::new(Int64Array::from(vec![1])), vec![2]);
+        let on = Expr::BinOp {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Column("k".into())),
+            right: Box::new(Expr::Column("k".into())),
+        };
+        let left = Box::new(FailOnceExec {
+            schema: l.schema(),
+            batch: l,
+            failed: false,
+        });
+        let right = Box::new(VecExec::new(r.schema(), vec![r]));
+        let mut exec = HashJoinExec::new(left, right, &on).unwrap();
+        assert!(exec.next().is_err());
+        assert!(exec.next().unwrap().is_none(), "no retry after an error");
+    }
 }
