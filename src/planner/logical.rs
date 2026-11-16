@@ -318,7 +318,7 @@ fn check_unique_agg_outputs(group_by: &[String], aggs: &[(AggFunc, Expr, String)
     Ok(())
 }
 
-fn contains_agg(expr: &Expr) -> bool {
+pub(crate) fn contains_agg(expr: &Expr) -> bool {
     match expr {
         Expr::Agg { .. } => true,
         Expr::BinOp { left, right, .. } => contains_agg(left) || contains_agg(right),

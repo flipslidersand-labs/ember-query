@@ -116,6 +116,8 @@ impl HashAggExec {
         let empty = RecordBatch::new_empty(in_schema.clone());
         for (func, expr, name) in &aggs {
             let dt = if matches!(func, AggFunc::Count) {
+                // 0 行入力でも COUNT の引数の存在しない列を検出する
+                evaluate(&empty, expr)?;
                 DataType::Int64
             } else {
                 let arg_dt = evaluate(&empty, expr)?.data_type().clone();
@@ -805,6 +807,21 @@ mod tests {
         HashAggExec::new(make_exec(cols, false), vec![], aggs)?
             .next()
             .map(|b| b.unwrap())
+    }
+
+    #[test]
+    fn count_of_missing_column_is_error_even_without_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let input = Box::new(MockExec {
+            schema,
+            batches: vec![],
+        });
+        assert!(HashAggExec::new(
+            input,
+            vec![],
+            vec![(AggFunc::Count, col("nope"), "c".into())]
+        )
+        .is_err());
     }
 
     #[test]
