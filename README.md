@@ -24,6 +24,7 @@ CSV ファイル向けの軽量分析ワークロード用ベクトル化 SQL �
 
 Limits / 制約:
 - Input is one CSV (schema inferred) / 入力は CSV 1 ファイル(スキーマは自動推定)
+- Float64 推論は有限の十進表記(数字・小数点・指数・符号)のみ。`nan`/`inf`/`infinity` は Float と見なさず、その列は Utf8 になる / Float inference accepts finite decimals only; `nan`/`inf`/`infinity` columns stay Utf8
 - JOIN 先は `<表名>.csv` を入力 CSV と同じディレクトリから探す(無ければエラー)
 - JOIN で列名が重なると右側は `right_` 接頭辞になる(例: `right_name`)
 - 列名・別名は Unicode NFC に正規化して照合するが、JOIN の表名は `{table}.csv` のファイル名解決に使うため正規化しない(NFC/NFD が異なるファイルは `not found in catalog` となり、該当ファイルがあればヒントを表示) / Table names are not normalized (file lookup); a differing NFC/NFD file name yields `not found in catalog` with a hint
