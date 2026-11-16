@@ -439,7 +439,12 @@ fn unique_column_item(items: &[SelectItem], key: &str) -> Result<Option<usize>> 
             _ => None,
         })
         .collect();
-    if hits.iter().any(|(_, c)| *c != hits[0].1) {
+    // Same rule as `resolve_column`: `name` and `t.name` are one column,
+    // `t1.name` and `t2.name` are not.
+    let distinct = hits
+        .iter()
+        .any(|(_, a)| hits.iter().any(|(_, b)| !same_column(a, b)));
+    if distinct {
         anyhow::bail!(
             "column '{}' is ambiguous: matches {:?}",
             key,
@@ -779,7 +784,7 @@ mod tests {
     fn order_by_expr_alias_sorts_between_two_projects() {
         for sql in [
             "SELECT 0 - id AS id FROM a ORDER BY id, name",
-            "SELECT -id AS q FROM a ORDER BY name, q",
+            "SELECT -id AS q FROM a ORDER BY name, q, id",
             "SELECT 0 - id AS id, COUNT(*) FROM a GROUP BY id ORDER BY id",
         ] {
             let p = plan(sql).unwrap();
@@ -817,6 +822,27 @@ mod tests {
             lines[2]
         );
         assert_eq!(lines[3], "      Scan [a.csv] columns=[id:Int64, name:Utf8]");
+    }
+
+    #[test]
+    fn order_by_same_column_in_other_spelling_is_not_ambiguous() {
+        for sql in [
+            "SELECT name, a.name, 0-a.id AS q FROM a ORDER BY name, q, id",
+            "SELECT a.name, name, 0-a.id AS q FROM a ORDER BY name, q, id",
+        ] {
+            plan(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    #[test]
+    fn order_by_distinct_join_columns_stays_ambiguous() {
+        for sql in [
+            "SELECT a.id, b.id, 0-a.id AS q FROM a JOIN b ON a.id = b.id ORDER BY id, q, a.name",
+            "SELECT id, a.id, b.id, 0-a.id AS q FROM a JOIN b ON a.id = b.id ORDER BY id, q, a.name",
+        ] {
+            let err = plan(sql).expect_err(sql).to_string();
+            assert!(err.contains("ambiguous"), "{sql}: {err}");
+        }
     }
 
     #[test]

@@ -139,6 +139,19 @@ impl HashJoinExec {
         Ok(false)
     }
 
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        while !self.done {
+            if self.cur.is_none() && !self.advance_left()? {
+                self.done = true;
+                break;
+            }
+            if let Some(b) = self.emit()? {
+                return Ok(Some(b));
+            }
+        }
+        Ok(None)
+    }
+
     /// Build at most MAX_OUTPUT_ROWS rows from the current left batch.
     fn emit(&mut self) -> Result<Option<RecordBatch>> {
         let Some(cur) = self.cur.as_mut() else {
@@ -190,16 +203,13 @@ impl HashJoinExec {
 
 impl Executor for HashJoinExec {
     fn next(&mut self) -> Result<Option<RecordBatch>> {
-        while !self.done {
-            if self.cur.is_none() && !self.advance_left()? {
-                self.done = true;
-                break;
-            }
-            if let Some(b) = self.emit()? {
-                return Ok(Some(b));
-            }
+        let result = self.next_batch();
+        if result.is_err() {
+            // An error ends the stream; a later call must not resume.
+            self.done = true;
+            self.cur = None;
         }
-        Ok(None)
+        result
     }
 
     fn schema(&self) -> SchemaRef {
