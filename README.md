@@ -25,7 +25,10 @@ CSV ファイル向けの軽量分析ワークロード用ベクトル化 SQL �
 Limits / 制約:
 - Input is one CSV (schema inferred) / 入力は CSV 1 ファイル(スキーマは自動推定)
 - Float64 推論は有限の十進表記(数字・小数点・指数・符号)のみ。`nan`/`inf`/`infinity` は Float と見なさず、その列は Utf8 になる / Float inference accepts finite decimals only; `nan`/`inf`/`infinity` columns stay Utf8
+- 端末への出力(表のセル・列名・エラー文・`--explain`)では制御文字(C0/DEL/C1。ESC・改行・タブ・CR を含む)を `\x1b` `\n` `\t` のように可視表記へエスケープする(バックスラッシュ自体は変換しない) / Control characters (C0/DEL/C1, incl. ESC, newline, tab, CR) are escaped (e.g. `\x1b`, `\n`) in terminal output
+- 1 レコード(クォート内改行を含む)は 16 MiB まで、列数は 10000 まで。超えるとエラー / A record (incl. quoted newlines) is limited to 16 MiB and a header to 10000 columns; larger input is an error
 - JOIN 先は `<表名>.csv` を入力 CSV と同じディレクトリから探す(無ければエラー)
+- JOIN 先の `<表名>.csv` がシンボリックリンクならリンク先をそのまま読む。入力ディレクトリは信頼できる(他者が書き込めない)ものを前提とする / A JOIN `<table>.csv` that is a symlink is followed as-is; the input directory is assumed trusted (not writable by others)
 - JOIN で列名が重なると右側は `right_` 接頭辞になる(例: `right_name`)
 - 列名・別名は Unicode NFC に正規化して照合するが、JOIN の表名は `{table}.csv` のファイル名解決に使うため正規化しない(NFC/NFD が異なるファイルは `not found in catalog` となり、該当ファイルがあればヒントを表示) / Table names are not normalized (file lookup); a differing NFC/NFD file name yields `not found in catalog` with a hint
 
