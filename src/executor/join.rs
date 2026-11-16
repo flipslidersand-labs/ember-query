@@ -5,7 +5,7 @@ use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{evaluate, Executor};
+use super::{evaluate, scalar_key, Executor, ScalarKey};
 use crate::sql::ast::Expr;
 
 /// Hash inner join executor.
@@ -21,7 +21,7 @@ pub struct HashJoinExec {
     left_col: String,
     /// Whole build (right) side as one batch
     right_all: RecordBatch,
-    build_map: HashMap<JoinKey, Vec<u32>>,
+    build_map: HashMap<ScalarKey, Vec<u32>>,
     /// Probe position in the current left batch
     cur: Option<Probe>,
     done: bool,
@@ -94,7 +94,7 @@ impl HashJoinExec {
         drop(right_batches);
 
         // Build hash map: typed key → right row indices (in order). NULL keys are skipped.
-        let mut build_map: HashMap<JoinKey, Vec<u32>> = HashMap::new();
+        let mut build_map: HashMap<ScalarKey, Vec<u32>> = HashMap::new();
         if right_all.num_rows() > 0 {
             let key_arr = eval_column_str(&right_all, &right_col)?;
             for r_idx in 0..right_all.num_rows() {
@@ -245,53 +245,24 @@ fn eval_column_str(batch: &RecordBatch, col: &str) -> Result<ArrayRef> {
     evaluate(batch, &Expr::Column(col.to_string()))
 }
 
-/// Typed join key: values of different types never compare equal.
-#[derive(Debug, PartialEq, Eq, Hash)]
-enum JoinKey {
-    Int(i64),
-    /// Normalised bits (-0.0 → 0.0, all NaNs → one NaN)
-    Float(u64),
-    Str(String),
-    Bool(bool),
-}
-
 /// Returns `None` for NULL (SQL: NULL matches nothing).
-fn join_key(arr: &ArrayRef, idx: usize) -> Result<Option<JoinKey>> {
-    use arrow::array::*;
-    if arr.is_null(idx) {
-        return Ok(None);
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        let i = a.value(idx);
+fn join_key(arr: &ArrayRef, idx: usize) -> Result<Option<ScalarKey>> {
+    Ok(scalar_key(arr, idx)?.map(|k| match k {
         // Int64 = Float64 は Float64 に昇格して比較する(WHERE と同じ規則, #130)。
         // ただし 2^53 超などで f64 に正確に表せない Int64 は別の値と同一視
         // されないよう Int のまま持つ(Float とは一致しない)。
-        let f = i as f64;
-        // f < 2^63: i64::MAX は f64 で 2^63 に丸まり `as i64` が飽和するため除外
-        let lim = 2f64.powi(63);
-        if (-lim..lim).contains(&f) && f as i64 == i {
-            return Ok(Some(JoinKey::Float(f.to_bits())));
+        ScalarKey::Int(i) => {
+            let f = i as f64;
+            // f < 2^63: i64::MAX は f64 で 2^63 に丸まり `as i64` が飽和するため除外
+            let lim = 2f64.powi(63);
+            if (-lim..lim).contains(&f) && f as i64 == i {
+                ScalarKey::Float(f.to_bits())
+            } else {
+                ScalarKey::Int(i)
+            }
         }
-        return Ok(Some(JoinKey::Int(i)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        let v = a.value(idx);
-        let v = if v.is_nan() {
-            f64::NAN
-        } else if v == 0.0 {
-            0.0
-        } else {
-            v
-        };
-        return Ok(Some(JoinKey::Float(v.to_bits())));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return Ok(Some(JoinKey::Str(a.value(idx).to_string())));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
-        return Ok(Some(JoinKey::Bool(a.value(idx))));
-    }
-    Err(anyhow!("unsupported JOIN key type: {:?}", arr.data_type()))
+        k => k,
+    }))
 }
 
 /// Output schema of a JOIN. A right column whose name is taken gets a
@@ -331,7 +302,7 @@ mod key_tests {
     use super::*;
     use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
 
-    fn k(a: ArrayRef) -> Option<JoinKey> {
+    fn k(a: ArrayRef) -> Option<ScalarKey> {
         join_key(&a, 0).unwrap()
     }
     fn i(v: i64) -> ArrayRef {

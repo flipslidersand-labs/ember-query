@@ -25,6 +25,47 @@ pub trait Executor {
     fn schema(&self) -> SchemaRef;
 }
 
+// ── Scalar key (shared by JOIN and GROUP BY) ─────────────────────────────────
+
+/// Hashable typed key: values of different types never compare equal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ScalarKey {
+    Int(i64),
+    /// Normalised bits (-0.0 -> 0.0, all NaNs -> one NaN)
+    Float(u64),
+    Str(String),
+    Bool(bool),
+}
+
+/// Key of `arr[idx]`; `None` for NULL. Errors on types without a key.
+pub(crate) fn scalar_key(arr: &ArrayRef, idx: usize) -> Result<Option<ScalarKey>> {
+    if arr.is_null(idx) {
+        return Ok(None);
+    }
+    let any = arr.as_any();
+    if let Some(a) = any.downcast_ref::<Int64Array>() {
+        return Ok(Some(ScalarKey::Int(a.value(idx))));
+    }
+    if let Some(a) = any.downcast_ref::<Float64Array>() {
+        let v = a.value(idx);
+        let v = if v.is_nan() {
+            f64::NAN
+        } else if v == 0.0 {
+            0.0
+        } else {
+            v
+        };
+        return Ok(Some(ScalarKey::Float(v.to_bits())));
+    }
+    if let Some(a) = any.downcast_ref::<StringArray>() {
+        return Ok(Some(ScalarKey::Str(a.value(idx).to_string())));
+    }
+    if let Some(a) = any.downcast_ref::<BooleanArray>() {
+        return Ok(Some(ScalarKey::Bool(a.value(idx))));
+    }
+    Err(anyhow!("unsupported key type: {:?}", arr.data_type()))
+}
+
 // ── Column resolution ─────────────────────────────────────────────────────────
 
 /// Whether two column references name the same column: equal, or one is
