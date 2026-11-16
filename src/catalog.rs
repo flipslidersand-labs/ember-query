@@ -2,6 +2,59 @@ use anyhow::Result;
 use arrow::datatypes::DataType;
 use std::path::Path;
 
+/// 1 レコード(クォート内改行を含む)の最大バイト数。
+pub(crate) const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
+/// 列数の上限。
+pub(crate) const MAX_COLUMNS: usize = 10_000;
+
+/// 1 レコードのバイト数を `limit` までに制限する Read ラッパ。レコード境界は
+/// クォート外の `\n`(`"` の偶奇で判定)。超えたら `InvalidData` を返し、
+/// csv クレートが巨大な 1 レコードをバッファする前に打ち切る。
+pub(crate) struct BoundedRead<R> {
+    inner: R,
+    limit: usize,
+    in_quote: bool,
+    run: usize,
+}
+
+impl<R: std::io::Read> std::io::Read for BoundedRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        for &b in &buf[..n] {
+            match b {
+                b'"' => self.in_quote = !self.in_quote,
+                b'\n' if !self.in_quote => {
+                    self.run = 0;
+                    continue;
+                }
+                _ => {}
+            }
+            self.run += 1;
+            if self.run > self.limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("record exceeds the maximum size of {} bytes", self.limit),
+                ));
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// 入力 CSV を開く(1 レコードのサイズ上限つき)。infer と scan で共通。
+pub(crate) fn open_reader(path: &Path) -> std::io::Result<csv::Reader<BoundedRead<std::fs::File>>> {
+    let file = std::fs::File::open(path)?;
+    Ok(csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(BoundedRead {
+            inner: file,
+            limit: MAX_RECORD_BYTES,
+            in_quote: false,
+            run: 0,
+        }))
+}
+
 /// Column metadata.
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
@@ -18,12 +71,17 @@ pub struct TableSchema {
 /// Infer the schema of a CSV file by reading the header row and scanning every
 /// data row once.  Type priority: bool → i64 → f64 → String.
 pub fn infer_schema(path: &Path) -> Result<TableSchema> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true)
-        .from_path(path)?;
+    let mut reader = open_reader(path)?;
 
     let headers: Vec<String> = reader.headers()?.iter().map(crate::sql::nfc).collect();
+    if headers.len() > MAX_COLUMNS {
+        anyhow::bail!(
+            "too many columns ({}, maximum {}) in header of {}",
+            headers.len(),
+            MAX_COLUMNS,
+            path.display()
+        );
+    }
     let line_offset = physical_line_offset(&reader);
 
     // 空名・重複名は列が黙って参照不能になるためエラー(大文字小文字違いは別名)。
@@ -350,6 +408,43 @@ mod tests {
         let ts = infer_schema(&f.0).unwrap();
         let names: Vec<&str> = ts.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn oversized_record_without_newline_is_error() {
+        // /dev/zero 相当: 改行のない巨大入力はメモリを食い尽くす前にエラーにする。
+        let f = TmpCsv::new(&"x".repeat(MAX_RECORD_BYTES + 1));
+        let err = infer_schema(&f.0).unwrap_err().to_string();
+        assert!(err.contains("record"), "{err}");
+    }
+
+    #[test]
+    fn oversized_quoted_multiline_record_is_error() {
+        let mut s = String::from("a\n\"");
+        s.push_str(&"line\n".repeat(MAX_RECORD_BYTES / 5 + 1));
+        s.push_str("\"\n");
+        let f = TmpCsv::new(&s);
+        assert!(infer_schema(&f.0).is_err());
+    }
+
+    #[test]
+    fn many_short_lines_are_not_limited() {
+        // 上限はレコード単位。総サイズでは弾かない。
+        let f = TmpCsv::new(&format!("a\n{}", "1\n".repeat(MAX_RECORD_BYTES / 2 + 1)));
+        assert!(infer_schema(&f.0).is_ok());
+    }
+
+    #[test]
+    fn too_many_columns_is_error() {
+        let header = vec!["c"; MAX_COLUMNS + 1]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c}{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let f = TmpCsv::new(&format!("{header}\n"));
+        let err = infer_schema(&f.0).unwrap_err().to_string();
+        assert!(err.contains("columns"), "{err}");
     }
 
     #[test]
