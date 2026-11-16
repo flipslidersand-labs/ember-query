@@ -240,13 +240,13 @@ pub fn build(
         if orders_by_expr_alias(&stmt.select, &stmt.order_by) {
             // An alias of a computed expression only exists after the Project.
             let items = agg_project.take().unwrap_or_default();
-            plan = sort_over_project(plan, items, &stmt.order_by);
+            plan = sort_over_project(plan, items, &stmt.order_by)?;
         } else {
             plan = sort_node(plan, &resolve_order_aliases(&stmt.select, &stmt.order_by));
         }
     } else if let Some(order_by) = hidden_order_by(&stmt.select, &stmt.order_by) {
         if orders_by_expr_alias(&stmt.select, &stmt.order_by) {
-            plan = sort_over_project(plan, stmt.select.clone(), &stmt.order_by);
+            plan = sort_over_project(plan, stmt.select.clone(), &stmt.order_by)?;
         } else {
             // 5/6. ORDER BY refers to columns the SELECT list drops: sort the
             // Project's input, then project.
@@ -364,7 +364,7 @@ fn sort_over_project(
     input: LogicalPlan,
     items: Vec<SelectItem>,
     order_by: &[OrderByItem],
-) -> LogicalPlan {
+) -> Result<LogicalPlan> {
     // Every wide column gets a unique internal name, so the final Project
     // picks by identity, never by a (possibly duplicated) output name.
     let internal = |i: usize| format!("__ob_{i}");
@@ -374,18 +374,19 @@ fn sort_over_project(
             SelectItem::Expr(_, Some(a)) => a.clone(),
             SelectItem::Expr(Expr::Column(c), None) => c.clone(),
             SelectItem::Expr(Expr::Literal(v), None) => format!("{:?}", v),
-            _ => "expr".to_string(),
+            SelectItem::Expr(_, None) | SelectItem::Wildcard => "expr".to_string(),
         })
         .collect();
     let n = items.len();
+    // Callers never pass `*` (hidden_order_by and agg_select_list rule it out).
     let mut wide: Vec<SelectItem> = items
         .iter()
         .enumerate()
         .map(|(i, item)| match item {
-            SelectItem::Expr(e, _) => SelectItem::Expr(e.clone(), Some(internal(i))),
-            SelectItem::Wildcard => SelectItem::Wildcard,
+            SelectItem::Expr(e, _) => Ok(SelectItem::Expr(e.clone(), Some(internal(i)))),
+            SelectItem::Wildcard => anyhow::bail!("SELECT * cannot be combined with this ORDER BY"),
         })
-        .collect();
+        .collect::<Result<_>>()?;
     // Rewrite each key to the internal name of the item it denotes: an alias
     // first, then an unaliased column, else a hidden input column appended.
     let keys: Vec<OrderByItem> = order_by
@@ -394,12 +395,7 @@ fn sort_over_project(
             let hit = items
                 .iter()
                 .position(|i| matches!(i, SelectItem::Expr(_, Some(a)) if *a == o.column))
-                .or_else(|| {
-                    items.iter().position(|i| {
-                        matches!(i, SelectItem::Expr(Expr::Column(c), None)
-                            if same_column(c, &o.column))
-                    })
-                });
+                .map_or_else(|| unique_column_item(&items, &o.column), |i| Ok(Some(i)))?;
             let idx = hit.unwrap_or_else(|| {
                 wide.push(SelectItem::Expr(
                     Expr::Column(o.column.clone()),
@@ -407,12 +403,12 @@ fn sort_over_project(
                 ));
                 wide.len() - 1
             });
-            OrderByItem {
+            Ok(OrderByItem {
                 column: internal(idx),
                 ..o.clone()
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let sorted = sort_node(
         LogicalPlan::Project {
             input: Box::new(input),
@@ -420,7 +416,7 @@ fn sort_over_project(
         },
         &keys,
     );
-    LogicalPlan::Project {
+    Ok(LogicalPlan::Project {
         input: Box::new(sorted),
         exprs: out_names
             .into_iter()
@@ -428,7 +424,29 @@ fn sort_over_project(
             .map(|(i, name)| SelectItem::Expr(Expr::Column(internal(i)), Some(name)))
             .take(n)
             .collect(),
+    })
+}
+
+/// Index of the unaliased column item an ORDER BY key names. Several distinct
+/// columns matching is an error, as in `resolve_column`; repeating the same
+/// column (`SELECT qty, qty`) is not.
+fn unique_column_item(items: &[SelectItem], key: &str) -> Result<Option<usize>> {
+    let hits: Vec<(usize, &String)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            SelectItem::Expr(Expr::Column(c), None) if same_column(c, key) => Some((i, c)),
+            _ => None,
+        })
+        .collect();
+    if hits.iter().any(|(_, c)| *c != hits[0].1) {
+        anyhow::bail!(
+            "column '{}' is ambiguous: matches {:?}",
+            key,
+            hits.iter().map(|(_, c)| c).collect::<Vec<_>>()
+        );
     }
+    Ok(hits.first().map(|(i, _)| *i))
 }
 
 fn sort_node(input: LogicalPlan, order_by: &[OrderByItem]) -> LogicalPlan {
