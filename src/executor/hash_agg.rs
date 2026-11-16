@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{evaluate, resolve_column, Executor};
+use super::{evaluate, resolve_column, scalar_key, Executor, ScalarKey};
 use crate::sql::ast::{AggFunc, Expr};
 
 /// A typed MIN/MAX candidate (keeps the input type, no f64 round trip).
@@ -147,9 +147,9 @@ impl HashAggExec {
 
     fn run(&mut self) -> Result<RecordBatch> {
         // group key -> (per-agg states)
-        let mut map: HashMap<Vec<ScalarKey>, Vec<AggState>> = HashMap::new();
+        let mut map: HashMap<Vec<Option<ScalarKey>>, Vec<AggState>> = HashMap::new();
         // Preserve insertion order for deterministic output
-        let mut key_order: Vec<Vec<ScalarKey>> = Vec::new();
+        let mut key_order: Vec<Vec<Option<ScalarKey>>> = Vec::new();
 
         while let Some(batch) = self.input.next()? {
             // Extract group_by column arrays
@@ -172,8 +172,10 @@ impl HashAggExec {
 
             for row in 0..batch.num_rows() {
                 // Build group key
-                let key: Vec<ScalarKey> =
-                    group_arrays.iter().map(|arr| scalar_at(arr, row)).collect();
+                let key: Vec<Option<ScalarKey>> = group_arrays
+                    .iter()
+                    .map(|arr| scalar_key(arr, row))
+                    .collect::<Result<_>>()?;
 
                 let states = map.entry(key.clone()).or_insert_with(|| {
                     key_order.push(key.clone());
@@ -255,45 +257,6 @@ impl Executor for HashAggExec {
     }
 }
 
-// ── Scalar key type ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ScalarKey {
-    Int(i64),
-    Str(String),
-    Bool(bool),
-    /// Float bits; -0.0 is folded into 0.0 and all NaNs into one NaN so they group together.
-    Float(u64),
-    Null,
-}
-
-fn scalar_at(arr: &ArrayRef, row: usize) -> ScalarKey {
-    if arr.is_null(row) {
-        return ScalarKey::Null;
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return ScalarKey::Int(a.value(row));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        return ScalarKey::Str(a.value(row).to_string());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::BooleanArray>() {
-        return ScalarKey::Bool(a.value(row));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        let v = a.value(row);
-        let v = if v.is_nan() {
-            f64::NAN
-        } else if v == 0.0 {
-            0.0
-        } else {
-            v
-        };
-        return ScalarKey::Float(v.to_bits());
-    }
-    ScalarKey::Null
-}
-
 /// Fold one non-NULL value into the state. Int64 sums use checked_add.
 fn update_value(st: &mut AggState, func: &AggFunc, arr: &ArrayRef, row: usize) -> Result<()> {
     let any = arr.as_any();
@@ -336,7 +299,7 @@ fn update_value(st: &mut AggState, func: &AggFunc, arr: &ArrayRef, row: usize) -
 
 fn build_group_column(
     dt: &DataType,
-    key_order: &[Vec<ScalarKey>],
+    key_order: &[Vec<Option<ScalarKey>>],
     col_idx: usize,
     _n: usize,
 ) -> Result<ArrayRef> {
@@ -345,7 +308,7 @@ fn build_group_column(
             let mut b = Int64Builder::new();
             for key in key_order {
                 match key.get(col_idx) {
-                    Some(ScalarKey::Int(i)) => b.append_value(*i),
+                    Some(Some(ScalarKey::Int(i))) => b.append_value(*i),
                     _ => b.append_null(),
                 }
             }
@@ -355,7 +318,7 @@ fn build_group_column(
             let mut b = StringBuilder::new();
             for key in key_order {
                 match key.get(col_idx) {
-                    Some(ScalarKey::Str(s)) => b.append_value(s),
+                    Some(Some(ScalarKey::Str(s))) => b.append_value(s),
                     _ => b.append_null(),
                 }
             }
@@ -365,7 +328,7 @@ fn build_group_column(
             let mut b = Float64Builder::new();
             for key in key_order {
                 match key.get(col_idx) {
-                    Some(ScalarKey::Float(bits)) => b.append_value(f64::from_bits(*bits)),
+                    Some(Some(ScalarKey::Float(bits))) => b.append_value(f64::from_bits(*bits)),
                     _ => b.append_null(),
                 }
             }
@@ -375,7 +338,7 @@ fn build_group_column(
             let mut b = arrow::array::BooleanBuilder::new();
             for key in key_order {
                 match key.get(col_idx) {
-                    Some(ScalarKey::Bool(v)) => b.append_value(*v),
+                    Some(Some(ScalarKey::Bool(v))) => b.append_value(*v),
                     _ => b.append_null(),
                 }
             }
@@ -385,8 +348,8 @@ fn build_group_column(
             let mut b = StringBuilder::new();
             for key in key_order {
                 match key.get(col_idx) {
-                    Some(ScalarKey::Str(s)) => b.append_value(s),
-                    Some(ScalarKey::Int(i)) => b.append_value(i.to_string()),
+                    Some(Some(ScalarKey::Str(s))) => b.append_value(s),
+                    Some(Some(ScalarKey::Int(i))) => b.append_value(i.to_string()),
                     _ => b.append_null(),
                 }
             }
@@ -398,8 +361,8 @@ fn build_group_column(
 fn build_agg_column(
     func: &AggFunc,
     dt: &DataType,
-    key_order: &[Vec<ScalarKey>],
-    map: &HashMap<Vec<ScalarKey>, Vec<AggState>>,
+    key_order: &[Vec<Option<ScalarKey>>],
+    map: &HashMap<Vec<Option<ScalarKey>>, Vec<AggState>>,
     agg_idx: usize,
 ) -> Result<ArrayRef> {
     let states = key_order.iter().map(|k| &map[k][agg_idx]);
