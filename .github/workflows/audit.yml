@@ -25,7 +25,7 @@ jobs:
       contents: read
       checks: write # audit-check が結果を Check Run として書く
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
