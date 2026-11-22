@@ -1,5 +1,7 @@
 # ember-query
 
+Release type: `library`
+
 Small vectorized SQL query engine for lightweight analytical workloads on CSV files (Rust).
 
 CSV ファイル向けの軽量分析ワークロード用ベクトル化 SQL クエリエンジン。
