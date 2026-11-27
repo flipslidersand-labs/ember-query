@@ -939,9 +939,9 @@ dependencies = [
 
 [[package]]
 name = "pest"
-version = "2.9.6"
+version = "2.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec53fd1d256900a9a771bf2720d42cef6f8bc91b4e25065fbd291e3e7222576"
+checksum = "44cf434b793f79ab490e99ae3b2f9acce4ef02cdac3eee541a69de78c1aadd7c"
 dependencies = [
  "memchr",
  "pest_stack_guard",
